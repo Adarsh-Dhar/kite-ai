@@ -1,0 +1,8 @@
+fastapi
+uvicorn
+httpx
+python-dotenv
+gokite>=0.0.15
+google-generativeai
+pydantic>=2.0.0
+pydantic-settings
