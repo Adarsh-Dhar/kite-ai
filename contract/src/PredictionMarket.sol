@@ -534,8 +534,8 @@ contract KitePredictionMarket is ReentrancyGuard, Ownable {
         Market storage m = markets[marketId];
         uint256 total = m.yesReserve + m.noReserve;
         if (total == 0) return 5e17; // 50%
-        // Price of YES = noReserve / total  (from CPMM geometry)
-        return (m.noReserve * 1e18) / total;
+        // Probability of YES = yesReserve / total
+        return (m.yesReserve * 1e18) / total;
     }
 
     /// @notice Quote: how many shares would `amountIn` KITE buy?

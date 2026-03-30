@@ -2,7 +2,7 @@
 pragma solidity ^0.8.24;
 
 import "forge-std/Test.sol";
-import "../src/PredictionMarket.sol";
+import {KitePredictionMarket} from "../src/PredictionMarket.sol";
 
 /**
  * @title  PredictionMarketTest
@@ -16,6 +16,7 @@ contract PredictionMarketTest is Test {
     // ─────────────────────────────────────────────────────────────────
     //  Fixtures
     // ─────────────────────────────────────────────────────────────────
+    receive() external payable {}
 
     KitePredictionMarket public pm;
 
