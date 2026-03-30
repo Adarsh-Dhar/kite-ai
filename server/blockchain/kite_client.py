@@ -72,7 +72,7 @@ class KiteClient:
         abi_path: Path to the contract ABI JSON file.
     """
 
-    ABI_PATH = Path(__file__).parent.parent / "abi" / "PredictionMarket.json"
+    ABI_PATH = Path(__file__).parent.parent / "contract" / "PredictionMarket.json"
 
     def __init__(
         self,
