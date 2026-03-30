@@ -26,15 +26,15 @@ class Settings(BaseSettings):
         alias="GITHUB_REPO_NAME",
     )
 
-    # ── LLM (Gemini / OpenAI interchangeable) ────────────────────────────────
+    # ── LLM (Groq) ────────────────────────────────────────────────────────────
     llm_api_key: str = Field(
         default="",
-        alias="LLM_API_KEY",
-        description="API key for the LLM provider (Gemini, OpenAI, etc.).",
+        alias="GROQ_API_KEY",
+        description="API key for the Groq platform.",
     )
     llm_model: str = Field(
-        default="gemini-1.5-flash",
-        alias="LLM_MODEL",
+        default="llama-3.3-70b-versatile",
+        alias="GROQ_MODEL",
     )
 
     # ── Kite AI Blockchain ────────────────────────────────────────────────────

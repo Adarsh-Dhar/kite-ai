@@ -9,7 +9,7 @@ import "../src/PredictionMarket.sol";
  * @notice Foundry deployment script for KiteAI Testnet (chainId 2368).
  *
  * Usage:
- *   forge script script/Deploy.s.sol \
+ *   forge script script/Deploy.s.sol:DeployPredictionMarket \
  *     --rpc-url https://rpc-testnet.gokite.ai \
  *     --broadcast \
  *     --private-key $PRIVATE_KEY \

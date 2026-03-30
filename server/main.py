@@ -192,6 +192,7 @@ async def _run_full_cycle(
     architect = MarketArchitect(
         http_client=_http_client,
         llm_api_key=settings.llm_api_key,
+        llm_model=settings.llm_model,
         min_tss=min_tss,
     )
 
@@ -387,6 +388,7 @@ async def list_recent_prs(
         architect = MarketArchitect(
             http_client=_get_client(),
             llm_api_key=settings.llm_api_key,
+            llm_model=settings.llm_model,
         )
         for pr in prs:
             pr["tss_score"] = architect.compute_tss(pr)

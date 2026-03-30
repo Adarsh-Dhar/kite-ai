@@ -87,11 +87,13 @@ class MarketArchitect:
         self,
         http_client: httpx.AsyncClient,
         llm_api_key: str,
+        llm_model: str = "llama-3.3-70b-versatile",
         min_tss: float = DEFAULT_MIN_TSS,
-        llm_endpoint: str = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent",
+        llm_endpoint: str = "https://api.groq.com/openai/v1/chat/completions",
     ) -> None:
         self._client = http_client
         self._llm_api_key = llm_api_key
+        self._llm_model = llm_model
         self._min_tss = min_tss
         self._llm_endpoint = llm_endpoint
 
@@ -180,26 +182,26 @@ class MarketArchitect:
         )
 
     async def _call_llm(self, prompt: str) -> str:
-        headers = {"Content-Type": "application/json"}
-        params = {"key": self._llm_api_key}
+        headers = {
+            "Authorization": f"Bearer {self._llm_api_key}",
+            "Content-Type": "application/json"
+        }
         payload = {
-            "contents": [{"parts": [{"text": prompt}]}],
-            "generationConfig": {
-                "responseMimeType": "application/json",
-                "temperature": 0.4,
-                "maxOutputTokens": 512,
-            },
+            "model": self._llm_model,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0.4,
+            "max_tokens": 1024,
+            "response_format": {"type": "json_object"}
         }
         response = await self._client.post(
             self._llm_endpoint,
             headers=headers,
-            params=params,
             json=payload,
             timeout=45.0,
         )
         response.raise_for_status()
         body = response.json()
-        return body["candidates"][0]["content"]["parts"][0]["text"]
+        return body["choices"][0]["message"]["content"]
 
     @staticmethod
     def _parse_llm_response(raw: str) -> dict[str, Any]:
