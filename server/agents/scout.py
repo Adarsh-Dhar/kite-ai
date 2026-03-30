@@ -1,11 +1,11 @@
 """
 agent/scout.py — GitHub Scout
 ==============================
-Responsible for fetching recently merged Pull Requests and Release Tags
-from the anza-xyz/agave repository using the GitHub GraphQL API.
+Fetches recently merged Pull Requests and Release Tags from a GitHub
+repository using the GitHub GraphQL API.
 
-GraphQL is preferred over REST here to fetch exactly the fields we need
-in a single round-trip, minimising API quota consumption.
+GraphQL lets us get exactly the fields we need in a single round-trip,
+minimising API quota consumption.
 """
 
 import logging
@@ -17,9 +17,6 @@ log = logging.getLogger(__name__)
 
 GITHUB_GRAPHQL_URL = "https://api.github.com/graphql"
 
-# ── GraphQL query templates ───────────────────────────────────────────────────
-
-# Fetches recently merged PRs with title, body, labels, and file-change stats.
 _PR_QUERY = """
 query MergedPRs($owner: String!, $repo: String!, $first: Int!, $cursor: String) {
   repository(owner: $owner, name: $repo) {
@@ -51,7 +48,6 @@ query MergedPRs($owner: String!, $repo: String!, $first: Int!, $cursor: String) 
 }
 """
 
-# Fetches the latest release tags (semantic version tags).
 _TAGS_QUERY = """
 query ReleaseTags($owner: String!, $repo: String!, $first: Int!) {
   repository(owner: $owner, name: $repo) {
@@ -77,11 +73,11 @@ query ReleaseTags($owner: String!, $repo: String!, $first: Int!) {
 
 class GitHubScout:
     """
-    Async GitHub API client specialised for monitoring the Agave repository.
+    Async GitHub API client specialised for monitoring a repository.
 
     Args:
-        http_client: A shared httpx.AsyncClient instance (caller manages lifecycle).
-        github_token: GitHub Personal Access Token (PAT) for authentication.
+        http_client: A shared httpx.AsyncClient instance.
+        github_token: GitHub Personal Access Token.
         owner: Repository owner (default: ``anza-xyz``).
         repo: Repository name (default: ``agave``).
     """
@@ -99,27 +95,16 @@ class GitHubScout:
         self._headers = {
             "Authorization": f"Bearer {github_token}",
             "Content-Type": "application/json",
-            # GitHub recommends this header for GraphQL calls.
             "X-Github-Next-Global-ID": "1",
         }
 
-    # ── Public API ─────────────────────────────────────────────────────────────
-
     async def fetch_merged_prs(self, limit: int = 50) -> list[dict[str, Any]]:
-        """
-        Return up to *limit* recently merged PRs.
-
-        Paginates transparently if the initial page is insufficient.
-        Each node is flattened for downstream consumers.
-
-        Raises:
-            httpx.HTTPStatusError: Propagated so callers can detect rate-limits.
-        """
+        """Return up to *limit* recently merged PRs, flattened for downstream use."""
         results: list[dict[str, Any]] = []
         cursor: str | None = None
 
         while len(results) < limit:
-            batch_size = min(limit - len(results), 100)  # GraphQL cap = 100
+            batch_size = min(limit - len(results), 100)
             payload = {
                 "query": _PR_QUERY,
                 "variables": {
@@ -144,12 +129,7 @@ class GitHubScout:
         return results[:limit]
 
     async def fetch_release_tags(self, limit: int = 10) -> list[dict[str, Any]]:
-        """
-        Return up to *limit* recent release tags.
-
-        Raises:
-            httpx.HTTPStatusError: Propagated so callers can detect rate-limits.
-        """
+        """Return up to *limit* recent release tags."""
         payload = {
             "query": _TAGS_QUERY,
             "variables": {"owner": self._owner, "repo": self._repo, "first": limit},
@@ -160,40 +140,24 @@ class GitHubScout:
         tags = []
         for node in nodes:
             target = node.get("target", {})
-            tags.append(
-                {
-                    "name": node["name"],
-                    "date": target.get("tagger", {}).get("date")
-                    or target.get("committedDate"),
-                    "message": target.get("message") or target.get("messageHeadline", ""),
-                }
-            )
+            tags.append({
+                "name": node["name"],
+                "date": (target.get("tagger") or {}).get("date") or target.get("committedDate"),
+                "message": target.get("message") or target.get("messageHeadline", ""),
+            })
 
         log.info("Fetched %d release tags.", len(tags))
         return tags
 
-    # ── Internal helpers ───────────────────────────────────────────────────────
-
     async def _graphql(self, payload: dict[str, Any]) -> dict[str, Any]:
-        """
-        Execute a single GraphQL request and return the ``data`` field.
-
-        Handles:
-        - HTTP-level errors (rate limits → 403/429, auth → 401).
-        - GraphQL-level errors embedded in the 200-OK response body.
-        """
         response = await self._client.post(
             GITHUB_GRAPHQL_URL,
             json=payload,
             headers=self._headers,
         )
-
-        # Surface HTTP errors (rate-limit, auth, server errors).
         response.raise_for_status()
-
         body = response.json()
 
-        # GraphQL always returns 200, but may include ``errors``.
         if "errors" in body:
             error_msgs = "; ".join(e.get("message", str(e)) for e in body["errors"])
             log.error("GitHub GraphQL errors: %s", error_msgs)
@@ -203,14 +167,9 @@ class GitHubScout:
 
     @staticmethod
     def _flatten_pr(node: dict[str, Any]) -> dict[str, Any]:
-        """
-        Normalise a raw GraphQL PR node into a flat dict for easier processing
-        by the architect layer.
-        """
         labels = [lbl["name"] for lbl in (node.get("labels") or {}).get("nodes", [])]
         changed_files = [
-            f["path"]
-            for f in (node.get("files") or {}).get("nodes", [])
+            f["path"] for f in (node.get("files") or {}).get("nodes", [])
         ]
         return {
             "number": node["number"],

@@ -1,8 +1,9 @@
 fastapi
-uvicorn
+uvicorn[standard]
 httpx
 python-dotenv
-gokite>=0.0.15
+web3>=6.0.0
+eth-account>=0.10.0
 google-generativeai
 pydantic>=2.0.0
 pydantic-settings
