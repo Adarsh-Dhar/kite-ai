@@ -18,10 +18,11 @@ Tools:
 
 from __future__ import annotations
 
+
 import logging
 from typing import Any
-
 import httpx
+from server.config import Settings
 
 log = logging.getLogger(__name__)
 
@@ -41,8 +42,12 @@ class Web3Tools:
     Instantiate once; share the w3 connection.
     """
 
-    def __init__(self, rpc_url: str) -> None:
-        self._rpc_url = rpc_url
+    def __init__(self, rpc_url: str = None) -> None:
+        # Use provided rpc_url or fallback to config
+        if rpc_url is None:
+            self._rpc_url = Settings().kite_rpc_url
+        else:
+            self._rpc_url = rpc_url
         self._w3: Any | None = None
 
     async def _get_w3(self) -> Any:

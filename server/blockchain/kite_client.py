@@ -93,28 +93,13 @@ class KiteClient:
     async def sync_deployed_prs_from_db(self) -> None:
         """
         Load already-deployed PR numbers from Prisma at startup.
-        Replaces the old _load_deployed_prs() file read.
         """
-        try:
-            from db import db
-            records = await db.deployedpr.find_many(select={"prNumber": True})
-            self._deployed_prs_cache = {r.prNumber for r in records}
-            log.info(
-                "Synced %d deployed PRs from DB.", len(self._deployed_prs_cache)
-            )
-        except Exception as exc:
-            log.warning("Could not sync deployed PRs from DB: %s — starting fresh.", exc)
-            # Fall back to legacy JSON file if DB not ready
-            self._deployed_prs_cache = self._load_deployed_prs_legacy()
-
-    def _load_deployed_prs_legacy(self) -> set[int]:
-        """Backwards-compatible fallback to .deployed_prs.json."""
-        path = Path(__file__).parent.parent / ".deployed_prs.json"
-        try:
-            with open(path) as f:
-                return set(json.load(f))
-        except (FileNotFoundError, json.JSONDecodeError):
-            return set()
+        from db import db
+        records = await db.deployedpr.find_many(select={"prNumber": True})
+        self._deployed_prs_cache = {r.prNumber for r in records}
+        log.info(
+            "Synced %d deployed PRs from DB.", len(self._deployed_prs_cache)
+        )
 
     # ── Public API ─────────────────────────────────────────────────────────────
 

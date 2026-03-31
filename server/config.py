@@ -9,14 +9,14 @@ from pydantic_settings import BaseSettings
 
 
 class Settings(BaseSettings):
-    # ── Database ──────────────────────────────────────────────────────────────
+    # ── Database ─────────────────────────────────────────────────────────────
     database_url: str = Field(
         default="postgresql://user:password@localhost:5432/kite_markets",
         alias="DATABASE_URL",
         description="PostgreSQL connection string for Prisma.",
     )
 
-    # ── GitHub ────────────────────────────────────────────────────────────────
+    # ── GitHub ───────────────────────────────────────────────────────────────
     github_token: str = Field(
         ...,
         alias="GITHUB_TOKEN",
@@ -24,18 +24,19 @@ class Settings(BaseSettings):
     github_repo_owner: str = Field(default="anza-xyz", alias="GITHUB_REPO_OWNER")
     github_repo_name: str = Field(default="agave", alias="GITHUB_REPO_NAME")
 
-    # ── LLM (Groq) ────────────────────────────────────────────────────────────
+    # ── LLM (Groq) ───────────────────────────────────────────────────────────
     llm_api_key: str = Field(default="", alias="GROQ_API_KEY")
     llm_model: str = Field(default="llama-3.3-70b-versatile", alias="GROQ_MODEL")
 
-    # ── Kite AI Blockchain ────────────────────────────────────────────────────
+    # ── Kite AI Blockchain ───────────────────────────────────────────────────
+    # KITE_RPC_URL can be set to testnet or mainnet as needed (see env.example)
     kite_api_key: str = Field(default="", alias="KITE_API_KEY")
     kite_wallet_private_key: str = Field(default="", alias="KITE_WALLET_PRIVATE_KEY")
     kite_rpc_url: str = Field(default="https://rpc-testnet.gokite.ai", alias="KITE_RPC_URL")
     kite_market_factory_address: str = Field(default="", alias="KITE_MARKET_FACTORY_ADDRESS")
     kite_chain_id: int = Field(default=2368, alias="KITE_CHAIN_ID")
 
-    # ── Security Tools ────────────────────────────────────────────────────────
+    # ── Security Tools ───────────────────────────────────────────────────────
     nvd_api_key: str = Field(
         default="",
         alias="NVD_API_KEY",
