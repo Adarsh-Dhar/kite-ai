@@ -51,6 +51,7 @@ CREATE TABLE "deployed_prs" (
     "merged_at" TIMESTAMP(3),
     "tss_score" DOUBLE PRECISION,
     "deployed_at" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    "repo_name" TEXT,
     "market_id" TEXT,
 
     CONSTRAINT "deployed_prs_pkey" PRIMARY KEY ("id")
