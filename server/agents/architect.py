@@ -1,15 +1,18 @@
 """
-agent/architect.py — Market Architect (v2 — with DB-linked resolution strategy)
-=================================================================================
+agent/architect.py — Market Architect (v3 — Groq Function Calling for URL Verification)
+=========================================================================================
 Two responsibilities:
   1. TSS Filter — Score every PR with a Technical Significance Score.
   2. Market Generator — Call LLM to convert high-signal PRs into structured
      prediction market JSON objects WITH deterministic resolution strategies.
 
-New in v2:
-  • LLM must output resolution_type, data_source_url, evaluation_logic
-  • Strict validation of all resolution fields
-  • save_to_db() links the proposal to the Prisma Market record
+New in v3:
+  • _call_llm() now passes a `tools` array to Groq, forcing the model to
+    call `verify_data_source_url` before committing to a URL.
+  • _execute_tool_call() dispatches tool calls from the LLM response,
+    performs the real HTTP check, and feeds the result back to the model
+    in a second completion turn.
+  • This turns URL hallucination from a silent bug into a caught error.
 """
 
 from __future__ import annotations
@@ -61,17 +64,66 @@ _CORE_PATH_PATTERNS: list[tuple[re.Pattern[str], float]] = [
 
 DEFAULT_MIN_TSS = 0.65
 
-# Valid resolution types (must match Prisma enum)
 VALID_RESOLUTION_TYPES = {
     "GITHUB_PR", "GITHUB_RELEASE", "GITHUB_ISSUE",
     "CI_METRIC", "CVE_SECURITY", "WEB3_RPC",
     "DAO_GOVERNANCE", "LLM_JUDGE",
 }
 
-_MARKET_GENERATION_PROMPT = """\
-You are a crypto prediction market specialist with deep expertise in Solana blockchain development.
+# ── Groq tool definition ──────────────────────────────────────────────────────
+# This is the function schema the LLM must call to verify its proposed URL
+# before we accept the final market JSON.
 
-Analyse the following merged Pull Request from the anza-xyz/agave repository and generate a structured prediction market proposal.
+_VERIFY_URL_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "verify_data_source_url",
+        "description": (
+            "REQUIRED: You MUST call this tool with your proposed data_source_url "
+            "before generating the final market JSON. It checks whether the URL "
+            "is reachable and returns HTTP status + a snippet of the response. "
+            "If the URL returns 404 or is unreachable, you must revise it."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "url": {
+                    "type": "string",
+                    "description": "The exact API URL you plan to use as data_source_url in the market.",
+                },
+                "resolution_type": {
+                    "type": "string",
+                    "enum": list(VALID_RESOLUTION_TYPES),
+                    "description": "The resolution strategy you are proposing.",
+                },
+                "method": {
+                    "type": "string",
+                    "enum": ["GET", "POST"],
+                    "description": "HTTP method to use when checking the URL (use POST for JSON-RPC endpoints).",
+                    "default": "GET",
+                },
+            },
+            "required": ["url", "resolution_type"],
+        },
+    },
+}
+
+# ── System prompt ─────────────────────────────────────────────────────────────
+
+_SYSTEM_PROMPT = """\
+You are a crypto prediction market specialist with deep expertise in Solana \
+blockchain development. You generate structured prediction market proposals from \
+GitHub Pull Requests.
+
+CRITICAL RULE: Before finalising any market proposal, you MUST call the \
+`verify_data_source_url` tool with your proposed URL. If the tool reports a \
+non-200 status or an error, you must revise the URL and try again until you \
+have a verified, reachable URL. Only then output the final JSON.
+"""
+
+_MARKET_GENERATION_PROMPT = """\
+Analyse the following merged Pull Request from the anza-xyz/agave repository \
+and generate a structured prediction market proposal.
 
 ## Pull Request Details
 - **Number**: #{number}
@@ -83,67 +135,24 @@ Analyse the following merged Pull Request from the anza-xyz/agave repository and
 - **Body Summary**: {body_snippet}
 - **TSS Score**: {tss_score:.2f} / 1.00
 
-## Your Task
-Generate a JSON object with these EXACT keys — all are required:
+## Step 1 — Call verify_data_source_url
+First, decide on your resolution_type and data_source_url. Call the \
+`verify_data_source_url` tool with those values. Wait for the result. \
+If the URL is unreachable, revise and retry.
 
-1. "title" — A concise, technical, market-worthy title (max 80 chars). Must be specific to this change.
+## Step 2 — Output the final JSON
+Once your URL is verified (HTTP 200), output a JSON object with these EXACT keys:
 
-2. "description" — A binary Yes/No prediction question about a concrete, verifiable future outcome
-   related to this PR's deployment or impact. Be specific about timelines or metrics where possible.
-
-3. "options" — Always exactly ["Yes", "No"]
-
-4. "agent_reason" — 2-3 sentences explaining: (a) what this PR changes at a technical level,
-   (b) why it's market-worthy, and (c) what evidence would resolve the market.
-
-5. "resolution_type" — One of these exact strings (choose the BEST fit):
-   - "GITHUB_PR"       — market resolves by checking if a PR was merged/closed
-   - "GITHUB_RELEASE"  — market resolves by checking if a release tag was published
-   - "GITHUB_ISSUE"    — market resolves by checking if a GitHub issue was closed as "completed"
-   - "CI_METRIC"       — market resolves by reading CI/CD artifact data (coverage, benchmarks, bundle size)
-   - "CVE_SECURITY"    — market resolves by monitoring for a CVE advisory publication
-   - "WEB3_RPC"        — market resolves by querying on-chain data via an RPC node
-   - "DAO_GOVERNANCE"  — market resolves by checking a Snapshot or on-chain governance vote
-   - "LLM_JUDGE"       — fallback: market resolves by having an LLM read a URL and judge the outcome
-
-6. "data_source_url" — The EXACT API URL used to verify the outcome. Must be a real, callable URL.
-   Examples:
-   - GITHUB_PR: "https://api.github.com/repos/anza-xyz/agave/pulls/11532"
-   - GITHUB_RELEASE: "https://api.github.com/repos/anza-xyz/agave/releases/tags/v2.1.0"
-   - GITHUB_ISSUE: "https://api.github.com/repos/anza-xyz/agave/issues/8902"
-   - CI_METRIC: "https://api.github.com/repos/anza-xyz/agave/actions/runs" (resolver will find latest run)
-   - CVE_SECURITY: "https://services.nvd.nist.gov/rest/json/cves/2.0?keywordSearch=agave"
-   - WEB3_RPC: "https://rpc-testnet.gokite.ai" (resolver calls eth_getLogs or contract functions)
-   - DAO_GOVERNANCE: "https://hub.snapshot.org/graphql"
-
-7. "evaluation_logic" — A JSON object with deterministic machine-readable resolution rules.
-   The shape depends on resolution_type:
-
-   For GITHUB_PR:
-   {{ "check": "merged", "yes_condition": "merged == true", "no_condition": "state == closed AND merged == false" }}
-
-   For GITHUB_RELEASE:
-   {{ "tag_pattern": "v2.1.0", "yes_condition": "tag exists before deadline", "no_condition": "tag not published by deadline" }}
-
-   For GITHUB_ISSUE:
-   {{ "issue_number": 8902, "yes_condition": "state == closed AND state_reason == completed", "no_condition": "state == closed AND state_reason == not_planned OR deadline passed" }}
-
-   For CI_METRIC:
-   {{ "metric_name": "coverage_delta", "artifact_name": "coverage-report.json", "json_path": "$.delta", "operator": ">=", "threshold": 2.0 }}
-
-   For CVE_SECURITY:
-   {{ "keyword": "agave-consensus", "min_severity": "CRITICAL", "yes_condition": "critical CVE published before deadline" }}
-
-   For WEB3_RPC:
-   {{ "method": "event_count", "contract_address": "0x...", "event_name": "MarketCreated", "threshold": 10000 }}
-
-   For DAO_GOVERNANCE:
-   {{ "proposal_id": "0xabc...", "space": "solana.eth", "quorum_required": 0.66, "yes_condition": "state == closed AND choice_0_wins AND quorum_reached" }}
-
-   For LLM_JUDGE:
-   {{ "fetch_urls": ["https://..."], "question": "Did X happen by deadline?", "uncertainty_action": "INVALID" }}
-
-8. "resolution_condition" — A plain-English one-liner: "If merged==true → YES. If closed without merge → NO. Past deadline → NO."
+1. "title"              — Concise market title (max 80 chars).
+2. "description"        — Binary Yes/No prediction question.
+3. "options"            — Always exactly ["Yes", "No"].
+4. "agent_reason"       — 2-3 sentences: what the PR changes, why it's market-worthy, \
+what resolves it.
+5. "resolution_type"    — One of: GITHUB_PR, GITHUB_RELEASE, GITHUB_ISSUE, CI_METRIC, \
+CVE_SECURITY, WEB3_RPC, DAO_GOVERNANCE, LLM_JUDGE.
+6. "data_source_url"    — The VERIFIED URL from Step 1.
+7. "evaluation_logic"   — JSON object with machine-readable resolution rules.
+8. "resolution_condition" — Plain-English one-liner.
 
 Respond with ONLY valid JSON. No markdown fences, no preamble.
 """
@@ -173,22 +182,18 @@ class MarketArchitect:
             pr.get("body", "").lower()[:2000],
             " ".join(pr.get("labels", [])).lower(),
         ])
-
         for keyword, weight in _SIGNAL_KEYWORDS.items():
             if keyword in text_corpus:
                 score += weight
-
         for keyword, weight in _NOISE_KEYWORDS.items():
             if keyword in text_corpus:
                 score += weight
-
         for file_path in pr.get("changed_files", []):
             path_lower = file_path.lower()
             for pattern, weight in _CORE_PATH_PATTERNS:
                 if pattern.search(path_lower):
                     score += weight
                     break
-
         total_churn = pr.get("additions", 0) + pr.get("deletions", 0)
         if total_churn > 5000:
             score += 0.15
@@ -196,7 +201,6 @@ class MarketArchitect:
             score += 0.10
         elif total_churn > 300:
             score += 0.05
-
         return max(0.0, min(1.0, score))
 
     def filter_high_signal(self, prs: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -205,86 +209,225 @@ class MarketArchitect:
             score = self.compute_tss(pr)
             pr["tss_score"] = round(score, 4)
             if score >= self._min_tss:
-                log.info(
-                    "PR #%s passed TSS (score=%.2f): %s",
-                    pr.get("number"), score, pr.get("title", ""),
-                )
+                log.info("PR #%s passed TSS (%.2f): %s", pr.get("number"), score, pr.get("title", ""))
                 high_signal.append(pr)
             else:
-                log.debug(
-                    "PR #%s filtered (score=%.2f): %s",
-                    pr.get("number"), score, pr.get("title", ""),
-                )
+                log.debug("PR #%s filtered (%.2f): %s", pr.get("number"), score, pr.get("title", ""))
         high_signal.sort(key=lambda p: p["tss_score"], reverse=True)
         return high_signal
 
     # ── Market Generation ─────────────────────────────────────────────────────
 
-
     async def generate_market_proposal(self, pr: dict[str, Any], max_retries: int = 3) -> dict[str, Any]:
         """
-        Generate a market proposal and verify its data_source_url before returning.
-        If the URL is invalid/unreachable, retry up to max_retries times.
+        Generate a market proposal using Groq function-calling to verify
+        the data_source_url before accepting the LLM's output.
+        Falls back to a deterministic proposal if the LLM is unavailable.
         """
+        prompt = self._build_prompt(pr)
+        last_error = "Unknown error"
+
         for attempt in range(max_retries):
-            prompt = self._build_prompt(pr)
             try:
                 if not self._llm_api_key:
                     raise ValueError("LLM_API_KEY not set — using fallback.")
-                raw_json = await self._call_llm(prompt)
+
+                raw_json, verification_record = await self._call_llm_with_tools(prompt)
                 proposal = self._parse_llm_response(raw_json)
-            except Exception as exc:
-                log.warning("LLM call failed (%s). Using fallback.", exc)
-                proposal = self._fallback_proposal(pr)
 
-            proposal["tss_score"] = pr.get("tss_score", 0.0)
-            proposal["source_pr_number"] = pr.get("number")
-            proposal["source_pr_url"] = pr.get("url")
+                # Log what the LLM verified
+                if verification_record:
+                    log.info(
+                        "[Architect] LLM verified URL via tool call: %s → HTTP %s",
+                        verification_record.get("url"),
+                        verification_record.get("status_code"),
+                    )
 
-            # Pre-deployment verification step
-            ok, err = await self.verify_data_source_url(proposal)
-            if ok:
+                # Final sanity check — re-verify post-parse
+                ok, err = await self._http_verify(proposal.get("data_source_url", ""))
+                if not ok:
+                    last_error = f"Post-parse URL check failed: {err}"
+                    log.warning("[Architect] attempt %d/%d: %s", attempt + 1, max_retries, last_error)
+                    continue
+
+                proposal["tss_score"]        = pr.get("tss_score", 0.0)
+                proposal["source_pr_number"] = pr.get("number")
+                proposal["source_pr_url"]    = pr.get("url")
                 return proposal
-            log.warning(f"[MarketArchitect] data_source_url verification failed (attempt {attempt+1}/{max_retries}): {err}")
-        raise RuntimeError(f"Failed to generate a valid market proposal after {max_retries} attempts: last error: {err}")
 
-    async def verify_data_source_url(self, proposal: dict[str, Any]) -> tuple[bool, str]:
-        """
-        Verifies that the data_source_url in the proposal is reachable and returns 200 OK (or is a valid RPC endpoint).
-        Returns (True, "") if valid, else (False, error_message).
-        """
-        url = proposal.get("data_source_url")
-        if not url or not isinstance(url, str):
-            return False, "Missing or invalid data_source_url"
+            except Exception as exc:
+                last_error = str(exc)
+                log.warning("[Architect] LLM call failed (attempt %d/%d): %s", attempt + 1, max_retries, exc)
 
-        # HTTP(S) endpoints: check for 200 OK
-        if url.startswith("http://") or url.startswith("https://"):
-            try:
-                async with httpx.AsyncClient(timeout=10.0) as client:
+        log.warning("[Architect] All LLM attempts failed — using fallback proposal.")
+        proposal = self._fallback_proposal(pr)
+        proposal["tss_score"]        = pr.get("tss_score", 0.0)
+        proposal["source_pr_number"] = pr.get("number")
+        proposal["source_pr_url"]    = pr.get("url")
+        return proposal
+
+    # ── Groq with tool-calling ────────────────────────────────────────────────
+
+    async def _call_llm_with_tools(
+        self, prompt: str
+    ) -> tuple[str, dict[str, Any] | None]:
+        """
+        Two-turn Groq call with function-calling.
+
+        Turn 1: send the prompt with the verify_data_source_url tool definition.
+                The model MUST call the tool before answering.
+        Turn 2: execute the tool call (real HTTP check), return the result to
+                the model, receive the final market JSON.
+
+        Returns:
+            (final_json_text, verification_record)
+        """
+        headers = {
+            "Authorization": f"Bearer {self._llm_api_key}",
+            "Content-Type": "application/json",
+        }
+
+        messages: list[dict] = [
+            {"role": "system", "content": _SYSTEM_PROMPT},
+            {"role": "user",   "content": prompt},
+        ]
+
+        # ── Turn 1: prompt + tool definition ─────────────────────────────────
+        turn1_payload = {
+            "model": self._llm_model,
+            "messages": messages,
+            "tools": [_VERIFY_URL_TOOL],
+            "tool_choice": "required",   # Force the model to call our tool
+            "temperature": 0.2,
+            "max_tokens": 1024,
+        }
+
+        resp1 = await self._client.post(
+            self._llm_endpoint, headers=headers, json=turn1_payload, timeout=45.0
+        )
+        resp1.raise_for_status()
+        body1 = resp1.json()
+
+        assistant_msg = body1["choices"][0]["message"]
+        tool_calls = assistant_msg.get("tool_calls", [])
+
+        # If the model somehow skipped the tool call, handle gracefully
+        if not tool_calls:
+            log.warning("[Architect] Model skipped tool call — attempting direct parse.")
+            content = assistant_msg.get("content", "")
+            return content, None
+
+        # ── Execute tool calls ────────────────────────────────────────────────
+        # In practice Groq returns one tool call here; we handle multiple just in case.
+        tool_results: list[dict] = []
+        verification_record: dict[str, Any] | None = None
+
+        for tc in tool_calls:
+            if tc.get("function", {}).get("name") != "verify_data_source_url":
+                continue
+
+            args = json.loads(tc["function"].get("arguments", "{}"))
+            url            = args.get("url", "")
+            resolution_type = args.get("resolution_type", "")
+            method         = args.get("method", "GET").upper()
+
+            # Real HTTP verification
+            status_code, snippet, error = await self._execute_verify_tool(url, method)
+
+            verification_record = {
+                "url":             url,
+                "resolution_type": resolution_type,
+                "status_code":     status_code,
+                "snippet":         snippet,
+                "error":           error,
+            }
+
+            # Build the tool result message
+            if error:
+                result_text = (
+                    f"VERIFICATION FAILED for {url}\n"
+                    f"Error: {error}\n"
+                    f"You MUST choose a different, valid URL and revise your market proposal."
+                )
+            elif status_code == 200:
+                result_text = (
+                    f"VERIFICATION PASSED for {url}\n"
+                    f"HTTP 200 OK. Response snippet:\n{snippet}\n"
+                    f"You may now output the final market JSON using this URL."
+                )
+            else:
+                result_text = (
+                    f"VERIFICATION FAILED for {url}\n"
+                    f"HTTP {status_code}. This URL is not valid.\n"
+                    f"You MUST choose a different URL."
+                )
+
+            tool_results.append({
+                "role":         "tool",
+                "tool_call_id": tc["id"],
+                "content":      result_text,
+            })
+
+        # ── Turn 2: feed tool results back, get final JSON ────────────────────
+        messages_turn2: list[dict] = [
+            *messages,
+            {"role": "assistant", **{k: v for k, v in assistant_msg.items() if k != "role"}},
+            *tool_results,
+        ]
+
+        turn2_payload = {
+            "model": self._llm_model,
+            "messages": messages_turn2,
+            "temperature": 0.2,
+            "max_tokens": 1500,
+            "response_format": {"type": "json_object"},
+        }
+
+        resp2 = await self._client.post(
+            self._llm_endpoint, headers=headers, json=turn2_payload, timeout=45.0
+        )
+        resp2.raise_for_status()
+        body2 = resp2.json()
+
+        final_content = body2["choices"][0]["message"]["content"]
+        return final_content, verification_record
+
+    async def _execute_verify_tool(
+        self, url: str, method: str = "GET"
+    ) -> tuple[int | None, str, str | None]:
+        """
+        Actually hit the URL and return (status_code, response_snippet, error).
+        Used as the implementation of the `verify_data_source_url` tool.
+        """
+        if not url or not url.startswith("http"):
+            return None, "", f"Invalid URL format: {url!r}"
+
+        try:
+            async with httpx.AsyncClient(timeout=12.0) as client:
+                if method == "POST":
+                    # For JSON-RPC endpoints (WEB3_RPC, DAO_GOVERNANCE)
+                    resp = await client.post(
+                        url,
+                        json={"jsonrpc": "2.0", "id": 1, "method": "web3_clientVersion", "params": []},
+                        headers={"Content-Type": "application/json"},
+                    )
+                else:
                     resp = await client.get(url)
-                    if resp.status_code == 200:
-                        return True, ""
-                    return False, f"HTTP status {resp.status_code} for {url}"
-            except Exception as exc:
-                return False, f"HTTP error for {url}: {exc}"
 
-        # Web3/RPC endpoints: try a basic JSON-RPC call
-        if url.startswith("ws://") or url.startswith("wss://") or "/rpc" in url:
-            try:
-                # Try a basic POST to check if endpoint is alive
-                async with httpx.AsyncClient(timeout=10.0) as client:
-                    resp = await client.post(url, json={"jsonrpc": "2.0", "id": 1, "method": "web3_clientVersion", "params": []})
-                    if resp.status_code == 200:
-                        return True, ""
-                    return False, f"RPC status {resp.status_code} for {url}"
-            except Exception as exc:
-                return False, f"RPC error for {url}: {exc}"
+                snippet = resp.text[:300].replace("\n", " ")
+                return resp.status_code, snippet, None
 
-        # Fallback: treat as invalid
-        return False, f"Unrecognized or unsupported data_source_url: {url}"
+        except httpx.TimeoutException:
+            return None, "", f"Request timed out after 12s: {url}"
+        except httpx.ConnectError as exc:
+            return None, "", f"Connection refused: {exc}"
+        except Exception as exc:
+            return None, "", f"Unexpected error: {exc}"
+
+    # ── Fallback / parse helpers ──────────────────────────────────────────────
 
     def _build_prompt(self, pr: dict[str, Any]) -> str:
-        key_files = ", ".join(pr.get("changed_files", [])[:10]) or "N/A"
+        key_files    = ", ".join(pr.get("changed_files", [])[:10]) or "N/A"
         body_snippet = (pr.get("body", "") or "")[:600].replace("\n", " ")
         return _MARKET_GENERATION_PROMPT.format(
             number=pr.get("number", "?"),
@@ -299,57 +442,26 @@ class MarketArchitect:
             tss_score=pr.get("tss_score", 0.0),
         )
 
-    async def _call_llm(self, prompt: str) -> str:
-        headers = {
-            "Authorization": f"Bearer {self._llm_api_key}",
-            "Content-Type": "application/json"
-        }
-        payload = {
-            "model": self._llm_model,
-            "messages": [{"role": "user", "content": prompt}],
-            "temperature": 0.3,
-            "max_tokens": 1500,
-            "response_format": {"type": "json_object"}
-        }
-        response = await self._client.post(
-            self._llm_endpoint,
-            headers=headers,
-            json=payload,
-            timeout=45.0,
-        )
-        response.raise_for_status()
-        body = response.json()
-        return body["choices"][0]["message"]["content"]
-
     @staticmethod
     def _parse_llm_response(raw: str) -> dict[str, Any]:
         cleaned = re.sub(r"```json|```", "", raw).strip()
         data = json.loads(cleaned)
 
-        # Core market fields
-        required_market = {"title", "description", "options", "agent_reason"}
-        # Resolution strategy fields (new in v2)
-        required_resolution = {"resolution_type", "data_source_url", "evaluation_logic", "resolution_condition"}
-
-        missing = (required_market | required_resolution) - data.keys()
+        required = {
+            "title", "description", "options", "agent_reason",
+            "resolution_type", "data_source_url", "evaluation_logic", "resolution_condition",
+        }
+        missing = required - data.keys()
         if missing:
             raise ValueError(f"LLM response missing keys: {missing}")
 
-        # Validate resolution_type
         res_type = data.get("resolution_type", "").upper()
         if res_type not in VALID_RESOLUTION_TYPES:
-            raise ValueError(
-                f"Invalid resolution_type '{res_type}'. "
-                f"Must be one of: {VALID_RESOLUTION_TYPES}"
-            )
-        data["resolution_type"] = res_type  # normalise to upper
+            raise ValueError(f"Invalid resolution_type '{res_type}'.")
+        data["resolution_type"] = res_type
 
-        # Validate evaluation_logic is a dict
-        eval_logic = data.get("evaluation_logic")
-        if not isinstance(eval_logic, dict):
+        if not isinstance(data.get("evaluation_logic"), dict):
             raise ValueError("evaluation_logic must be a JSON object.")
-
-        # Validate data_source_url is a non-empty string
         if not isinstance(data.get("data_source_url"), str) or not data["data_source_url"].startswith("http"):
             raise ValueError("data_source_url must be a valid HTTP(S) URL.")
 
@@ -357,12 +469,25 @@ class MarketArchitect:
         return data
 
     @staticmethod
-    def _fallback_proposal(pr: dict[str, Any]) -> dict[str, Any]:
-        title = pr.get("title", "Unknown Change")
-        number = pr.get("number", 0)
-        labels = ", ".join(pr.get("labels", [])) or "none"
-        pr_api_url = f"https://api.github.com/repos/anza-xyz/agave/pulls/{number}"
+    async def _http_verify(url: str) -> tuple[bool, str]:
+        """Lightweight post-parse URL check (no JSON-RPC fallback)."""
+        if not url or not url.startswith("http"):
+            return False, f"Not a valid URL: {url!r}"
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.get(url)
+                if resp.status_code == 200:
+                    return True, ""
+                return False, f"HTTP {resp.status_code}"
+        except Exception as exc:
+            return False, str(exc)
 
+    @staticmethod
+    def _fallback_proposal(pr: dict[str, Any]) -> dict[str, Any]:
+        number    = pr.get("number", 0)
+        title     = pr.get("title", "Unknown Change")
+        labels    = ", ".join(pr.get("labels", [])) or "none"
+        pr_api_url = f"https://api.github.com/repos/anza-xyz/agave/pulls/{number}"
         return {
             "title": f"Impact of PR #{number}: {title[:60]}",
             "description": (
@@ -371,16 +496,15 @@ class MarketArchitect:
             ),
             "options": ["Yes", "No"],
             "agent_reason": (
-                f"PR #{number} carries a high Technical Significance Score and "
-                f"touches core Solana validator code. Labels: {labels}. "
-                f"Fallback proposal — LLM service unavailable."
+                f"PR #{number} carries a high Technical Significance Score. "
+                f"Labels: {labels}. Fallback proposal — LLM service unavailable."
             ),
             "resolution_type": "GITHUB_PR",
             "data_source_url": pr_api_url,
             "evaluation_logic": {
-                "check": "merged",
+                "check":         "merged",
                 "yes_condition": "merged == true",
-                "no_condition": "state == closed AND merged == false",
+                "no_condition":  "state == closed AND merged == false",
             },
             "resolution_condition": (
                 "If merged==true → YES. "
@@ -399,45 +523,42 @@ class MarketArchitect:
         """
         After a successful on-chain deployment, persist the full market record
         (including resolution strategy) to the Prisma database.
-
-        Returns the created Prisma Market record, or None on failure.
         """
         try:
             from db import db
             from datetime import datetime, timezone, timedelta
 
-            onchain_id = receipt.get("market_id")
-            resolution_days = 30
-            deadline_ts = receipt.get("resolution_deadline")
-            if deadline_ts:
-                deadline_dt = datetime.fromtimestamp(deadline_ts, tz=timezone.utc)
-            else:
-                deadline_dt = datetime.now(timezone.utc) + timedelta(days=resolution_days)
+            onchain_id   = receipt.get("market_id")
+            deadline_ts  = receipt.get("resolution_deadline")
+            deadline_dt  = (
+                datetime.fromtimestamp(deadline_ts, tz=timezone.utc)
+                if deadline_ts
+                else datetime.now(timezone.utc) + timedelta(days=30)
+            )
 
             market = await db.market.create(
                 data={
-                    "onchainMarketId": int(onchain_id) if onchain_id is not None else None,
-                    "transactionHash": receipt.get("transaction_hash"),
-                    "blockNumber": receipt.get("block_number"),
-                    "contractAddress": receipt.get("contract_address"),
-                    "title": proposal.get("title", ""),
-                    "question": proposal.get("description", ""),
-                    "category": receipt.get("category", "Solana"),
-                    "agentReason": proposal.get("agent_reason", ""),
-                    "resolutionType": proposal.get("resolution_type", "GITHUB_PR"),
-                    "dataSourceUrl": proposal.get("data_source_url", ""),
-                    "evaluationLogic": proposal.get("evaluation_logic", {}),
-                    "sourcePrNumber": proposal.get("source_pr_number"),
-                    "sourcePrUrl": proposal.get("source_pr_url"),
-                    "tssScore": proposal.get("tss_score"),
-                    "initialLiquidityEth": receipt.get("initial_liquidity_eth"),
+                    "onchainMarketId":    int(onchain_id) if onchain_id is not None else None,
+                    "transactionHash":    receipt.get("transaction_hash"),
+                    "blockNumber":        receipt.get("block_number"),
+                    "contractAddress":    receipt.get("contract_address"),
+                    "title":              proposal.get("title", ""),
+                    "question":           proposal.get("description", ""),
+                    "category":           receipt.get("category", "Solana"),
+                    "agentReason":        proposal.get("agent_reason", ""),
+                    "resolutionType":     proposal.get("resolution_type", "GITHUB_PR"),
+                    "dataSourceUrl":      proposal.get("data_source_url", ""),
+                    "evaluationLogic":    proposal.get("evaluation_logic", {}),
+                    "sourcePrNumber":     proposal.get("source_pr_number"),
+                    "sourcePrUrl":        proposal.get("source_pr_url"),
+                    "tssScore":           proposal.get("tss_score"),
+                    "initialLiquidityEth":receipt.get("initial_liquidity_eth"),
                     "resolutionDeadline": deadline_dt,
-                    "status": "OPEN",
-                    "outcome": "UNRESOLVED",
+                    "status":             "OPEN",
+                    "outcome":            "UNRESOLVED",
                 }
             )
 
-            # Also record the deployed PR to replace .deployed_prs.json
             pr_number = proposal.get("source_pr_number")
             if pr_number:
                 await db.deployedpr.upsert(
@@ -445,8 +566,8 @@ class MarketArchitect:
                     data={
                         "create": {
                             "prNumber": int(pr_number),
-                            "prTitle": proposal.get("title", "")[:200],
-                            "prUrl": proposal.get("source_pr_url"),
+                            "prTitle":  proposal.get("title", "")[:200],
+                            "prUrl":    proposal.get("source_pr_url"),
                             "tssScore": proposal.get("tss_score"),
                             "marketId": market.id,
                         },

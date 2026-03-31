@@ -27,21 +27,9 @@ const navItems = [
   },
   {
     label: 'Markets',
-    href: '/dashboard/markets',
+    href: '/markets',
     icon: BarChart2,
     description: 'Prediction Markets',
-  },
-  {
-    label: 'War Room',
-    href: '/market/sample',
-    icon: TrendingUp,
-    description: 'Market',
-  },
-  {
-    label: 'Repo Intel',
-    href: '/repo/sample/repo',
-    icon: GitBranch,
-    description: 'Repository',
   },
   {
     label: 'Architect',
@@ -75,7 +63,7 @@ export function SidebarNav() {
           const Icon = item.icon;
           const isActive =
             pathname === item.href ||
-            (item.href !== '/' && pathname.startsWith(item.href));
+            (item.href !== '/' && pathname?.startsWith(item.href));
 
           return (
             <Link

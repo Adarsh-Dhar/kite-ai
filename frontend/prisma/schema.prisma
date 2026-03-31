@@ -9,7 +9,7 @@ generator py {
 
 generator client {
   provider = "prisma-client-js"
-  output   = "../frontend/lib/generated/client"
+  output   = "../lib/generated/client"
 }
 
 

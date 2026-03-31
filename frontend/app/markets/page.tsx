@@ -83,7 +83,7 @@ function MarketCard({ market }: { market: Market }) {
   const deadline = timeUntil(market.resolutionDeadline);
 
   return (
-    <Link href={`/dashboard/markets/${market.id}`}>
+    <Link href={`/markets/${market.id}`}>
       <div className="group relative bg-[#0a0a0a] border border-[#1a1a1a] rounded-xl p-5 hover:border-[#00ff00]/40 transition-all duration-300 cursor-pointer overflow-hidden">
         {/* Glow effect on hover */}
         <div className="absolute inset-0 bg-[#00ff00]/[0.02] opacity-0 group-hover:opacity-100 transition-opacity pointer-events-none" />
