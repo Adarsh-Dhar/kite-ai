@@ -9,7 +9,7 @@ import {
   GitBranch,
   User,
   Terminal,
-  Logo as LogoIcon,
+  BarChart2,
 } from 'lucide-react';
 
 const navItems = [
@@ -24,6 +24,12 @@ const navItems = [
     href: '/explore',
     icon: Compass,
     description: 'Explorer',
+  },
+  {
+    label: 'Markets',
+    href: '/dashboard/markets',
+    icon: BarChart2,
+    description: 'Prediction Markets',
   },
   {
     label: 'War Room',
@@ -93,7 +99,7 @@ export function SidebarNav() {
         })}
       </nav>
 
-      {/* Bottom section - could be used for settings/logout */}
+      {/* Bottom section */}
       <div className="mt-auto">
         <button
           className="w-12 h-12 rounded-lg text-[#888888] hover:text-[#00ff00] hover:bg-[#1a1a1a] flex items-center justify-center transition-all duration-200"
