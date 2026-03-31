@@ -1,8 +1,6 @@
 
 import { CONTRACT_ABI } from "./abi";
 import { CONTRACT_ADDRESS } from "./address";
-
-export { CONTRACT_ABI, CONTRACT_ADDRESS };
 export const RPC_URL = 'https://rpc-testnet.gokite.ai';
 export const CHAIN_ID = 2368;
 export const CHAIN_HEX = '0x940'; // 2368 in hex

@@ -1,15 +1,15 @@
 """
-Market Architect Agent — FastAPI Entry Point
-============================================
+Market Architect Agent — FastAPI Entry Point (v2)
+=================================================
 Autonomous agent that continuously scouts GitHub for high-signal PRs in
 anza-xyz/agave and deploys prediction markets on the Kite AI blockchain.
 
-Architecture:
-  • Lifespan starts a background asyncio task that runs every POLL_INTERVAL_SECONDS
-  • GitHubScout  → fetches merged PRs via GraphQL
-  • MarketArchitect → TSS filter + LLM market proposal generation
-  • KiteClient   → signs and broadcasts createMarket() transactions
-  • /status      → exposes live agent state (cycles run, markets deployed, errors)
+New in v2:
+  • Prisma DB connection at startup (replaces JSON file state)
+  • MarketArchitect.save_proposal_to_db() called after each deployment
+  • ResolverAgent wired as a background asyncio task
+  • /markets endpoint queries DB for richer market data
+  • AgentCycle records written to DB for observability
 """
 
 import asyncio
@@ -27,8 +27,10 @@ from pydantic import BaseModel
 
 from agents.architect import MarketArchitect
 from agents.scout import GitHubScout
+from agents.resolver import continuous_resolver_loop
 from blockchain.kite_client import KiteClient
 from config import Settings
+from db import connect_db, disconnect_db
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -37,26 +39,12 @@ logging.basicConfig(
 )
 log = logging.getLogger("market_architect")
 
-
-# ── App-level singletons ─────────────────────────────────────────────────────
+# ── App-level singletons ──────────────────────────────────────────────────────
 settings = Settings()  # type: ignore[call-arg]
 _http_client: httpx.AsyncClient | None = None
 _kite_client: KiteClient | None = None
 
-# ── Market metadata DB (market_id → proposal/meta) ──
-import os, json
-_MARKET_DB_PATH = os.path.join(os.path.dirname(__file__), 'market_db.json')
-def _load_market_db():
-    if os.path.exists(_MARKET_DB_PATH):
-        with open(_MARKET_DB_PATH) as f:
-            return json.load(f)
-    return {}
-def _save_market_db(db):
-    with open(_MARKET_DB_PATH, 'w') as f:
-        json.dump(db, f)
-_market_db = _load_market_db()
-
-# ── Live agent state (in-memory, for /status endpoint) ───────────────────────
+# ── Live agent state ──────────────────────────────────────────────────────────
 _agent_state: dict[str, Any] = {
     "started_at": None,
     "cycles_run": 0,
@@ -66,18 +54,20 @@ _agent_state: dict[str, Any] = {
     "last_cycle_at": None,
     "next_cycle_at": None,
     "last_cycle_errors": [],
-    "recent_deployments": deque(maxlen=50),  # last 50 market receipts
+    "recent_deployments": deque(maxlen=50),
     "recent_proposals": deque(maxlen=50),
     "loop_running": False,
 }
 
 
-# ── Lifespan: start/stop background scout loop ───────────────────────────────
-
+# ── Lifespan ──────────────────────────────────────────────────────────────────
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _http_client, _kite_client, _agent_state, _market_db
+    global _http_client, _kite_client, _agent_state
+
+    # Connect to database
+    await connect_db()
 
     _http_client = httpx.AsyncClient(timeout=30.0)
     _kite_client = KiteClient(
@@ -88,11 +78,15 @@ async def lifespan(app: FastAPI):
         resolution_days=settings.market_resolution_days,
         chain_id=settings.kite_chain_id,
     )
+
+    # Sync deployed PR cache from DB
+    await _kite_client.sync_deployed_prs_from_db()
+
     _agent_state["started_at"] = _utc_now()
     _agent_state["loop_running"] = True
 
     log.info("=" * 60)
-    log.info(" Market Architect Agent — Starting Up")
+    log.info(" Market Architect Agent v2 — Starting Up")
     log.info("=" * 60)
     log.info("  RPC:       %s", settings.kite_rpc_url)
     log.info("  Contract:  %s", settings.kite_market_factory_address or "(not set)")
@@ -102,12 +96,11 @@ async def lifespan(app: FastAPI):
     log.info("  Web3 OK:   %s", _kite_client.is_ready())
     log.info("=" * 60)
 
-    # Start the continuous scouting loop
+    # Start background tasks
     scout_task = asyncio.create_task(_continuous_scout_loop())
-
-    # Start the resolver loop
-    from agents import resolver
-    resolver_task = asyncio.create_task(resolver.continuous_resolver_loop(_kite_client, _market_db))
+    resolver_task = asyncio.create_task(
+        continuous_resolver_loop(_kite_client, settings)
+    )
 
     yield
 
@@ -115,15 +108,14 @@ async def lifespan(app: FastAPI):
     _agent_state["loop_running"] = False
     scout_task.cancel()
     resolver_task.cancel()
-    try:
-        await scout_task
-    except asyncio.CancelledError:
-        pass
-    try:
-        await resolver_task
-    except asyncio.CancelledError:
-        pass
+    for t in (scout_task, resolver_task):
+        try:
+            await t
+        except asyncio.CancelledError:
+            pass
+
     await _http_client.aclose()
+    await disconnect_db()
     log.info("Market Architect Agent shut down.")
 
 
@@ -145,28 +137,15 @@ app.add_middleware(
 )
 
 
-# ── Background loop ───────────────────────────────────────────────────────────
+# ── Background scout loop ─────────────────────────────────────────────────────
 
 async def _continuous_scout_loop() -> None:
-    """
-    Runs forever. On each iteration:
-      1. Fetches merged PRs from anza-xyz/agave
-      2. Scores them with TSS filter
-      3. Calls LLM to generate market proposals
-      4. Deploys markets on-chain (unless dry_run=True)
-      5. Sleeps for poll_interval_seconds
-    """
     interval = settings.poll_interval_seconds
-
-    # Brief startup delay so the server is ready before the first cycle
     await asyncio.sleep(5)
 
     while True:
         cycle_start = datetime.now(timezone.utc)
-        log.info(
-            "━━━ Auto-cycle #%d starting ━━━",
-            _agent_state["cycles_run"] + 1,
-        )
+        log.info("━━━ Auto-cycle #%d starting ━━━", _agent_state["cycles_run"] + 1)
 
         try:
             result = await _run_full_cycle(
@@ -178,15 +157,28 @@ async def _continuous_scout_loop() -> None:
             log.error("Auto-cycle crashed: %s", exc, exc_info=True)
             _agent_state["last_cycle_errors"] = [str(exc)]
 
-        next_run = _utc_now_str()
-        _agent_state["next_cycle_at"] = (
-            f"in ~{interval}s ({next_run})"
+        duration_ms = int(
+            (datetime.now(timezone.utc) - cycle_start).total_seconds() * 1000
         )
 
-        log.info(
-            "━━━ Cycle complete. Sleeping %ds ━━━",
-            interval,
-        )
+        # Record cycle to DB
+        try:
+            from db import db
+            await db.agentcycle.create(data={
+                "cycleType": "SCOUT",
+                "startedAt": cycle_start,
+                "completedAt": datetime.now(timezone.utc),
+                "durationMs": duration_ms,
+                "prsAnalysed": _agent_state.get("_last_prs", 0),
+                "marketsProposed": _agent_state.get("_last_proposed", 0),
+                "marketsDeployed": _agent_state.get("_last_deployed", 0),
+                "errors": _agent_state["last_cycle_errors"],
+            })
+        except Exception as exc:
+            log.warning("Could not write AgentCycle to DB: %s", exc)
+
+        _agent_state["next_cycle_at"] = f"in ~{interval}s"
+        log.info("━━━ Cycle complete. Sleeping %ds ━━━", interval)
         await asyncio.sleep(interval)
 
 
@@ -196,11 +188,6 @@ async def _run_full_cycle(
     dry_run: bool = False,
     min_tss: float | None = None,
 ) -> dict[str, Any]:
-    """
-    Executes one full scout → filter → propose → deploy cycle.
-    Updates global _agent_state in-place.
-    Returns a summary dict.
-    """
     if _http_client is None or _kite_client is None:
         raise RuntimeError("Agent not initialised.")
 
@@ -224,7 +211,7 @@ async def _run_full_cycle(
     proposals: list[dict] = []
     receipts: list[dict] = []
 
-    # ── 1. Fetch PRs ──────────────────────────────────────────────────────────
+    # 1. Fetch PRs
     try:
         prs = await scout.fetch_merged_prs(limit=settings.pr_fetch_limit)
         tags = await scout.fetch_release_tags(limit=10)
@@ -238,11 +225,10 @@ async def _run_full_cycle(
 
     _agent_state["total_prs_analysed"] += len(prs)
 
-    # ── 2. TSS filter ─────────────────────────────────────────────────────────
+    # 2. TSS filter
     high_signal = architect.filter_high_signal(prs)
     log.info("%d / %d PRs passed TSS ≥ %.2f", len(high_signal), len(prs), min_tss)
 
-    # Remove PRs already deployed this session
     new_prs = [
         pr for pr in high_signal
         if not _kite_client.already_deployed(pr.get("number", 0))
@@ -251,7 +237,7 @@ async def _run_full_cycle(
     if skipped:
         log.info("Skipping %d already-deployed PRs.", skipped)
 
-    # ── 3. Generate proposals ─────────────────────────────────────────────────
+    # 3. Generate proposals
     for pr in new_prs:
         try:
             proposal = await architect.generate_market_proposal(pr)
@@ -261,6 +247,7 @@ async def _run_full_cycle(
                 "pr_title": pr.get("title", "")[:80],
                 "market_title": proposal.get("title", "")[:80],
                 "tss_score": proposal.get("tss_score"),
+                "resolution_type": proposal.get("resolution_type"),
                 "generated_at": _utc_now_str(),
             })
         except Exception as exc:
@@ -271,38 +258,46 @@ async def _run_full_cycle(
     _agent_state["total_markets_proposed"] += len(proposals)
     log.info("Generated %d market proposals.", len(proposals))
 
-
-    # ── 4. Deploy on-chain ───────────────────────────────────────────────
+    # 4. Deploy on-chain + persist to DB
     if not dry_run and proposals:
         for proposal in proposals:
             try:
                 receipt = await _kite_client.create_onchain_market(proposal)
                 if receipt.get("skipped"):
                     continue
+
                 receipts.append(receipt)
                 _agent_state["recent_deployments"].appendleft({
                     **receipt,
                     "market_title": receipt.get("market_title", "")[:80],
                 })
-                # Store proposal/meta by market_id for resolver
-                market_id = receipt.get("market_id")
-                if market_id:
-                    _market_db[str(market_id)] = proposal
-                    _save_market_db(_market_db)
-                log.info(
-                    "✅ Market deployed: '%s' | tx=%s | block=%s",
-                    receipt.get("market_title", "")[:50],
-                    str(receipt.get("transaction_hash", ""))[:16] + "…",
-                    receipt.get("block_number"),
-                )
+
+                # ── NEW: persist to DB via architect ──────────────────────────
+                db_market = await MarketArchitect.save_proposal_to_db(proposal, receipt)
+                if db_market:
+                    log.info(
+                        "✅ Market deployed + persisted: '%s' | db=%s | tx=%s",
+                        receipt.get("market_title", "")[:50],
+                        db_market.id,
+                        str(receipt.get("transaction_hash", ""))[:16] + "…",
+                    )
+                else:
+                    log.warning(
+                        "Market deployed on-chain but DB save failed: '%s'",
+                        receipt.get("market_title", "")[:50],
+                    )
+
             except Exception as exc:
                 msg = f"Deployment failed for '{proposal.get('title', '')}': {exc}"
                 log.error(msg)
                 errors.append(msg)
+
     elif dry_run:
         log.info("DRY RUN — skipping %d deployments.", len(proposals))
 
-    # ── 5. Update global state ────────────────────────────────────────────────
+    _agent_state["_last_prs"] = len(prs)
+    _agent_state["_last_proposed"] = len(proposals)
+    _agent_state["_last_deployed"] = len(receipts)
     _update_state(len(prs), len(proposals), len(receipts), errors)
 
     return {
@@ -315,12 +310,7 @@ async def _run_full_cycle(
     }
 
 
-def _update_state(
-    prs: int,
-    proposed: int,
-    deployed: int,
-    errors: list[str],
-) -> None:
+def _update_state(prs: int, proposed: int, deployed: int, errors: list[str]) -> None:
     _agent_state["cycles_run"] += 1
     _agent_state["total_markets_deployed"] += deployed
     _agent_state["last_cycle_at"] = _utc_now_str()
@@ -328,16 +318,6 @@ def _update_state(
 
 
 # ── Pydantic schemas ──────────────────────────────────────────────────────────
-
-class MarketProposal(BaseModel):
-    title: str
-    description: str
-    options: list[str]
-    agent_reason: str
-    tss_score: float
-    source_pr_number: int | None = None
-    source_pr_url: str | None = None
-
 
 class RunCycleRequest(BaseModel):
     dry_run: bool = False
@@ -369,9 +349,6 @@ async def health() -> dict:
 
 @app.get("/status", tags=["meta"])
 async def agent_status() -> dict:
-    """
-    Full live agent state: cycle stats, recent deployments, config summary.
-    """
     contract_info: dict = {}
     if _kite_client:
         try:
@@ -381,7 +358,8 @@ async def agent_status() -> dict:
 
     return {
         "agent_state": {
-            **{k: v for k, v in _agent_state.items() if k not in ("recent_deployments", "recent_proposals")},
+            **{k: v for k, v in _agent_state.items()
+               if k not in ("recent_deployments", "recent_proposals", "_last_prs", "_last_proposed", "_last_deployed")},
             "recent_deployments": list(_agent_state["recent_deployments"])[:10],
             "recent_proposals": list(_agent_state["recent_proposals"])[:10],
         },
@@ -400,9 +378,8 @@ async def agent_status() -> dict:
 @app.get("/scout/prs", tags=["scout"])
 async def list_recent_prs(
     limit: int = Query(default=20, ge=1, le=100),
-    score: bool = Query(default=True, description="Attach TSS scores"),
+    score: bool = Query(default=True),
 ) -> list[dict]:
-    """Fetch and optionally score recent merged PRs (no deployment)."""
     scout = GitHubScout(
         http_client=_get_client(),
         github_token=settings.github_token,
@@ -428,7 +405,6 @@ async def list_recent_prs(
 
 @app.get("/scout/tags", tags=["scout"])
 async def list_recent_tags(limit: int = Query(default=10, ge=1, le=50)) -> list[dict]:
-    """Fetch recent release tags from the watched repository."""
     scout = GitHubScout(
         http_client=_get_client(),
         github_token=settings.github_token,
@@ -443,14 +419,7 @@ async def list_recent_tags(limit: int = Query(default=10, ge=1, le=50)) -> list[
 
 @app.post("/run-cycle", tags=["agent"], response_model=RunCycleResponse)
 async def run_cycle(body: RunCycleRequest = RunCycleRequest()) -> RunCycleResponse:
-    """
-    Manually trigger one full scouting + deployment cycle.
-    Returns immediately with results (synchronous, may take 30-120s).
-    """
-    result = await _run_full_cycle(
-        dry_run=body.dry_run,
-        min_tss=body.min_tss,
-    )
+    result = await _run_full_cycle(dry_run=body.dry_run, min_tss=body.min_tss)
     return RunCycleResponse(
         prs_analysed=result["prs_analysed"],
         markets_proposed=result["markets_proposed"],
@@ -461,23 +430,17 @@ async def run_cycle(body: RunCycleRequest = RunCycleRequest()) -> RunCycleRespon
     )
 
 
-@app.post(
-    "/run-cycle/background",
-    tags=["agent"],
-    status_code=status.HTTP_202_ACCEPTED,
-)
+@app.post("/run-cycle/background", tags=["agent"], status_code=status.HTTP_202_ACCEPTED)
 async def run_cycle_background(
     background_tasks: BackgroundTasks,
     body: RunCycleRequest = RunCycleRequest(),
 ) -> dict:
-    """Kick off a manual cycle asynchronously and return immediately."""
     async def _task():
         try:
             result = await _run_full_cycle(dry_run=body.dry_run, min_tss=body.min_tss)
             log.info(
                 "Manual background cycle done: %d deployed, %d errors",
-                result["markets_deployed"],
-                len(result["errors"]),
+                result["markets_deployed"], len(result["errors"]),
             )
         except Exception as exc:
             log.exception("Manual background cycle failed: %s", exc)
@@ -487,27 +450,124 @@ async def run_cycle_background(
 
 
 @app.get("/markets", tags=["blockchain"])
-async def list_deployed_markets() -> list[dict]:
-    """
-    Fetch all deployed markets from the on-chain contract.
-    Returns live data from the blockchain.
-    """
-    if not _kite_client or not _kite_client.is_ready():
-        raise HTTPException(
-            status_code=503,
-            detail="Blockchain client not ready. Set KITE_WALLET_PRIVATE_KEY and KITE_MARKET_FACTORY_ADDRESS.",
-        )
+async def list_deployed_markets(
+    status_filter: str = Query(default="OPEN", description="OPEN, RESOLVED, INVALID, or ALL"),
+    limit: int = Query(default=20, ge=1, le=100),
+) -> list[dict]:
+    """Fetch markets from the DB with full resolution metadata."""
     try:
-        w3_info = await _kite_client.get_contract_info()
-        return [w3_info]  # Extend: call getAllMarkets() for full list
+        from db import db
+        where = {} if status_filter == "ALL" else {"status": status_filter}
+        markets = await db.market.find_many(
+            where=where,
+            order={"createdAt": "desc"},
+            take=limit,
+        )
+        return [
+            {
+                "id": m.id,
+                "onchain_market_id": m.onchainMarketId,
+                "title": m.title,
+                "category": m.category,
+                "status": m.status,
+                "outcome": m.outcome,
+                "resolution_type": m.resolutionType,
+                "data_source_url": m.dataSourceUrl,
+                "tss_score": m.tssScore,
+                "source_pr_number": m.sourcePrNumber,
+                "created_at": m.createdAt.isoformat() if m.createdAt else None,
+                "resolved_at": m.resolvedAt.isoformat() if m.resolvedAt else None,
+                "resolution_deadline": m.resolutionDeadline.isoformat() if m.resolutionDeadline else None,
+                "resolve_attempts": m.resolveAttempts,
+                "last_error": m.lastError,
+            }
+            for m in markets
+        ]
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
+
+
+@app.get("/markets/{market_id}", tags=["blockchain"])
+async def get_market(market_id: str) -> dict:
+    """Get a single market with full resolution details and audit log."""
+    try:
+        from db import db
+        market = await db.market.find_unique(
+            where={"id": market_id},
+            include={"resolutionLogs": True},
+        )
+        if not market:
+            raise HTTPException(status_code=404, detail="Market not found")
+        return {
+            "id": market.id,
+            "onchain_market_id": market.onchainMarketId,
+            "title": market.title,
+            "question": market.question,
+            "category": market.category,
+            "status": market.status,
+            "outcome": market.outcome,
+            "resolution_type": market.resolutionType,
+            "data_source_url": market.dataSourceUrl,
+            "evaluation_logic": market.evaluationLogic,
+            "agent_reason": market.agentReason,
+            "tss_score": market.tssScore,
+            "source_pr_number": market.sourcePrNumber,
+            "source_pr_url": market.sourcePrUrl,
+            "transaction_hash": market.transactionHash,
+            "resolution_tx_hash": market.resolutionTxHash,
+            "resolution_note": market.resolutionNote,
+            "created_at": market.createdAt.isoformat() if market.createdAt else None,
+            "resolved_at": market.resolvedAt.isoformat() if market.resolvedAt else None,
+            "resolution_deadline": market.resolutionDeadline.isoformat() if market.resolutionDeadline else None,
+            "resolve_attempts": market.resolveAttempts,
+            "resolution_logs": [
+                {
+                    "attempt": log.attemptNumber,
+                    "resolver_type": log.resolverType,
+                    "decision": log.decision,
+                    "reasoning": log.reasoning,
+                    "tx_hash": log.txHash,
+                    "attempted_at": log.attemptedAt.isoformat(),
+                }
+                for log in (market.resolutionLogs or [])
+            ],
+        }
+    except HTTPException:
+        raise
     except Exception as exc:
         raise HTTPException(status_code=502, detail=str(exc))
 
 
 @app.get("/deployments", tags=["agent"])
 async def recent_deployments(limit: int = Query(default=20, ge=1, le=50)) -> list[dict]:
-    """Return the most recent market deployment receipts from this session."""
     return list(_agent_state["recent_deployments"])[:limit]
+
+
+@app.get("/cycles", tags=["agent"])
+async def recent_cycles(limit: int = Query(default=10, ge=1, le=50)) -> list[dict]:
+    """Fetch recent agent cycle records from DB."""
+    try:
+        from db import db
+        cycles = await db.agentcycle.find_many(
+            order={"startedAt": "desc"},
+            take=limit,
+        )
+        return [
+            {
+                "id": c.id,
+                "cycle_type": c.cycleType,
+                "started_at": c.startedAt.isoformat(),
+                "duration_ms": c.durationMs,
+                "prs_analysed": c.prsAnalysed,
+                "markets_proposed": c.marketsProposed,
+                "markets_deployed": c.marketsDeployed,
+                "markets_resolved": c.marketsResolved,
+                "errors": c.errors,
+            }
+            for c in cycles
+        ]
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -523,14 +583,8 @@ def _handle_github_error(exc: httpx.HTTPStatusError) -> None:
         raise HTTPException(status_code=502, detail="GitHub token invalid or missing.")
     if exc.response.status_code in (403, 429):
         reset = exc.response.headers.get("X-RateLimit-Reset", "unknown")
-        raise HTTPException(
-            status_code=429,
-            detail=f"GitHub rate limit. Resets at {reset}.",
-        )
-    raise HTTPException(
-        status_code=502,
-        detail=f"GitHub API error {exc.response.status_code}",
-    )
+        raise HTTPException(status_code=429, detail=f"GitHub rate limit. Resets at {reset}.")
+    raise HTTPException(status_code=502, detail=f"GitHub API error {exc.response.status_code}")
 
 
 def _utc_now() -> datetime:

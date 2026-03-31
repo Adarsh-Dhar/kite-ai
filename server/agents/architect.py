@@ -1,10 +1,15 @@
 """
-agent/architect.py — Market Architect
-=======================================
+agent/architect.py — Market Architect (v2 — with DB-linked resolution strategy)
+=================================================================================
 Two responsibilities:
   1. TSS Filter — Score every PR with a Technical Significance Score.
-  2. Market Generator — Call Gemini/OpenAI to convert high-signal PRs
-     into structured prediction market JSON objects.
+  2. Market Generator — Call LLM to convert high-signal PRs into structured
+     prediction market JSON objects WITH deterministic resolution strategies.
+
+New in v2:
+  • LLM must output resolution_type, data_source_url, evaluation_logic
+  • Strict validation of all resolution fields
+  • save_to_db() links the proposal to the Prisma Market record
 """
 
 from __future__ import annotations
@@ -56,6 +61,13 @@ _CORE_PATH_PATTERNS: list[tuple[re.Pattern[str], float]] = [
 
 DEFAULT_MIN_TSS = 0.65
 
+# Valid resolution types (must match Prisma enum)
+VALID_RESOLUTION_TYPES = {
+    "GITHUB_PR", "GITHUB_RELEASE", "GITHUB_ISSUE",
+    "CI_METRIC", "CVE_SECURITY", "WEB3_RPC",
+    "DAO_GOVERNANCE", "LLM_JUDGE",
+}
+
 _MARKET_GENERATION_PROMPT = """\
 You are a crypto prediction market specialist with deep expertise in Solana blockchain development.
 
@@ -72,13 +84,66 @@ Analyse the following merged Pull Request from the anza-xyz/agave repository and
 - **TSS Score**: {tss_score:.2f} / 1.00
 
 ## Your Task
-Generate a JSON object with these exact keys:
+Generate a JSON object with these EXACT keys — all are required:
+
 1. "title" — A concise, technical, market-worthy title (max 80 chars). Must be specific to this change.
-2. "description" — A binary Yes/No prediction question about a concrete, verifiable future outcome related to this PR's deployment or impact. Be specific about timelines or metrics where possible.
+
+2. "description" — A binary Yes/No prediction question about a concrete, verifiable future outcome
+   related to this PR's deployment or impact. Be specific about timelines or metrics where possible.
+
 3. "options" — Always exactly ["Yes", "No"]
-4. "agent_reason" — 2-3 sentences explaining: (a) what this PR changes at a technical level, (b) why it's market-worthy, and (c) what evidence would resolve the market.
-5. "resolution_endpoint" — The GitHub API URL for this PR (e.g., https://api.github.com/repos/anza-xyz/agave/pulls/11532)
-6. "resolution_condition" — A deterministic rule for resolving the market, e.g.: "If merged==true → YES. If state==closed AND merged==false → NO. Past deadline → NO."
+
+4. "agent_reason" — 2-3 sentences explaining: (a) what this PR changes at a technical level,
+   (b) why it's market-worthy, and (c) what evidence would resolve the market.
+
+5. "resolution_type" — One of these exact strings (choose the BEST fit):
+   - "GITHUB_PR"       — market resolves by checking if a PR was merged/closed
+   - "GITHUB_RELEASE"  — market resolves by checking if a release tag was published
+   - "GITHUB_ISSUE"    — market resolves by checking if a GitHub issue was closed as "completed"
+   - "CI_METRIC"       — market resolves by reading CI/CD artifact data (coverage, benchmarks, bundle size)
+   - "CVE_SECURITY"    — market resolves by monitoring for a CVE advisory publication
+   - "WEB3_RPC"        — market resolves by querying on-chain data via an RPC node
+   - "DAO_GOVERNANCE"  — market resolves by checking a Snapshot or on-chain governance vote
+   - "LLM_JUDGE"       — fallback: market resolves by having an LLM read a URL and judge the outcome
+
+6. "data_source_url" — The EXACT API URL used to verify the outcome. Must be a real, callable URL.
+   Examples:
+   - GITHUB_PR: "https://api.github.com/repos/anza-xyz/agave/pulls/11532"
+   - GITHUB_RELEASE: "https://api.github.com/repos/anza-xyz/agave/releases/tags/v2.1.0"
+   - GITHUB_ISSUE: "https://api.github.com/repos/anza-xyz/agave/issues/8902"
+   - CI_METRIC: "https://api.github.com/repos/anza-xyz/agave/actions/runs" (resolver will find latest run)
+   - CVE_SECURITY: "https://services.nvd.nist.gov/rest/json/cves/2.0?keywordSearch=agave"
+   - WEB3_RPC: "https://rpc-testnet.gokite.ai" (resolver calls eth_getLogs or contract functions)
+   - DAO_GOVERNANCE: "https://hub.snapshot.org/graphql"
+
+7. "evaluation_logic" — A JSON object with deterministic machine-readable resolution rules.
+   The shape depends on resolution_type:
+
+   For GITHUB_PR:
+   {{ "check": "merged", "yes_condition": "merged == true", "no_condition": "state == closed AND merged == false" }}
+
+   For GITHUB_RELEASE:
+   {{ "tag_pattern": "v2.1.0", "yes_condition": "tag exists before deadline", "no_condition": "tag not published by deadline" }}
+
+   For GITHUB_ISSUE:
+   {{ "issue_number": 8902, "yes_condition": "state == closed AND state_reason == completed", "no_condition": "state == closed AND state_reason == not_planned OR deadline passed" }}
+
+   For CI_METRIC:
+   {{ "metric_name": "coverage_delta", "artifact_name": "coverage-report.json", "json_path": "$.delta", "operator": ">=", "threshold": 2.0 }}
+
+   For CVE_SECURITY:
+   {{ "keyword": "agave-consensus", "min_severity": "CRITICAL", "yes_condition": "critical CVE published before deadline" }}
+
+   For WEB3_RPC:
+   {{ "method": "event_count", "contract_address": "0x...", "event_name": "MarketCreated", "threshold": 10000 }}
+
+   For DAO_GOVERNANCE:
+   {{ "proposal_id": "0xabc...", "space": "solana.eth", "quorum_required": 0.66, "yes_condition": "state == closed AND choice_0_wins AND quorum_reached" }}
+
+   For LLM_JUDGE:
+   {{ "fetch_urls": ["https://..."], "question": "Did X happen by deadline?", "uncertainty_action": "INVALID" }}
+
+8. "resolution_condition" — A plain-English one-liner: "If merged==true → YES. If closed without merge → NO. Past deadline → NO."
 
 Respond with ONLY valid JSON. No markdown fences, no preamble.
 """
@@ -98,6 +163,8 @@ class MarketArchitect:
         self._llm_model = llm_model
         self._min_tss = min_tss
         self._llm_endpoint = llm_endpoint
+
+    # ── TSS Scoring ───────────────────────────────────────────────────────────
 
     def compute_tss(self, pr: dict[str, Any]) -> float:
         score = 0.10
@@ -151,6 +218,8 @@ class MarketArchitect:
         high_signal.sort(key=lambda p: p["tss_score"], reverse=True)
         return high_signal
 
+    # ── Market Generation ─────────────────────────────────────────────────────
+
     async def generate_market_proposal(self, pr: dict[str, Any]) -> dict[str, Any]:
         prompt = self._build_prompt(pr)
         try:
@@ -165,12 +234,6 @@ class MarketArchitect:
         proposal["tss_score"] = pr.get("tss_score", 0.0)
         proposal["source_pr_number"] = pr.get("number")
         proposal["source_pr_url"] = pr.get("url")
-        # Add resolution_endpoint and resolution_condition if not present (fallback)
-        if "resolution_endpoint" not in proposal:
-            pr_number = pr.get("number")
-            proposal["resolution_endpoint"] = f"https://api.github.com/repos/anza-xyz/agave/pulls/{pr_number}" if pr_number else ""
-        if "resolution_condition" not in proposal:
-            proposal["resolution_condition"] = "If merged==true → YES. If state==closed AND merged==false → NO. Past deadline → NO."
         return proposal
 
     def _build_prompt(self, pr: dict[str, Any]) -> str:
@@ -197,8 +260,8 @@ class MarketArchitect:
         payload = {
             "model": self._llm_model,
             "messages": [{"role": "user", "content": prompt}],
-            "temperature": 0.4,
-            "max_tokens": 1024,
+            "temperature": 0.3,
+            "max_tokens": 1500,
             "response_format": {"type": "json_object"}
         }
         response = await self._client.post(
@@ -215,10 +278,34 @@ class MarketArchitect:
     def _parse_llm_response(raw: str) -> dict[str, Any]:
         cleaned = re.sub(r"```json|```", "", raw).strip()
         data = json.loads(cleaned)
-        required = {"title", "description", "options", "agent_reason", "resolution_endpoint", "resolution_condition"}
-        missing = required - data.keys()
+
+        # Core market fields
+        required_market = {"title", "description", "options", "agent_reason"}
+        # Resolution strategy fields (new in v2)
+        required_resolution = {"resolution_type", "data_source_url", "evaluation_logic", "resolution_condition"}
+
+        missing = (required_market | required_resolution) - data.keys()
         if missing:
             raise ValueError(f"LLM response missing keys: {missing}")
+
+        # Validate resolution_type
+        res_type = data.get("resolution_type", "").upper()
+        if res_type not in VALID_RESOLUTION_TYPES:
+            raise ValueError(
+                f"Invalid resolution_type '{res_type}'. "
+                f"Must be one of: {VALID_RESOLUTION_TYPES}"
+            )
+        data["resolution_type"] = res_type  # normalise to upper
+
+        # Validate evaluation_logic is a dict
+        eval_logic = data.get("evaluation_logic")
+        if not isinstance(eval_logic, dict):
+            raise ValueError("evaluation_logic must be a JSON object.")
+
+        # Validate data_source_url is a non-empty string
+        if not isinstance(data.get("data_source_url"), str) or not data["data_source_url"].startswith("http"):
+            raise ValueError("data_source_url must be a valid HTTP(S) URL.")
+
         data["options"] = ["Yes", "No"]
         return data
 
@@ -227,12 +314,13 @@ class MarketArchitect:
         title = pr.get("title", "Unknown Change")
         number = pr.get("number", 0)
         labels = ", ".join(pr.get("labels", [])) or "none"
+        pr_api_url = f"https://api.github.com/repos/anza-xyz/agave/pulls/{number}"
+
         return {
             "title": f"Impact of PR #{number}: {title[:60]}",
             "description": (
                 f"Will the changes introduced in agave PR #{number} "
-                f"({title[:80]}) be deployed to Solana mainnet-beta within "
-                f"60 days of the PR merge date?"
+                f"({title[:80]}) be merged into the master branch?"
             ),
             "options": ["Yes", "No"],
             "agent_reason": (
@@ -240,6 +328,91 @@ class MarketArchitect:
                 f"touches core Solana validator code. Labels: {labels}. "
                 f"Fallback proposal — LLM service unavailable."
             ),
-            "resolution_endpoint": f"https://api.github.com/repos/anza-xyz/agave/pulls/{number}",
-            "resolution_condition": "If merged==true → YES. If state==closed AND merged==false → NO. Past deadline → NO."
+            "resolution_type": "GITHUB_PR",
+            "data_source_url": pr_api_url,
+            "evaluation_logic": {
+                "check": "merged",
+                "yes_condition": "merged == true",
+                "no_condition": "state == closed AND merged == false",
+            },
+            "resolution_condition": (
+                "If merged==true → YES. "
+                "If state==closed AND merged==false → NO. "
+                "Past deadline → NO."
+            ),
         }
+
+    # ── DB Persistence ────────────────────────────────────────────────────────
+
+    @staticmethod
+    async def save_proposal_to_db(
+        proposal: dict[str, Any],
+        receipt: dict[str, Any],
+    ) -> Any | None:
+        """
+        After a successful on-chain deployment, persist the full market record
+        (including resolution strategy) to the Prisma database.
+
+        Returns the created Prisma Market record, or None on failure.
+        """
+        try:
+            from db import db
+            from datetime import datetime, timezone, timedelta
+
+            onchain_id = receipt.get("market_id")
+            resolution_days = 30
+            deadline_ts = receipt.get("resolution_deadline")
+            if deadline_ts:
+                deadline_dt = datetime.fromtimestamp(deadline_ts, tz=timezone.utc)
+            else:
+                deadline_dt = datetime.now(timezone.utc) + timedelta(days=resolution_days)
+
+            market = await db.market.create(
+                data={
+                    "onchainMarketId": int(onchain_id) if onchain_id is not None else None,
+                    "transactionHash": receipt.get("transaction_hash"),
+                    "blockNumber": receipt.get("block_number"),
+                    "contractAddress": receipt.get("contract_address"),
+                    "title": proposal.get("title", ""),
+                    "question": proposal.get("description", ""),
+                    "category": receipt.get("category", "Solana"),
+                    "agentReason": proposal.get("agent_reason", ""),
+                    "resolutionType": proposal.get("resolution_type", "GITHUB_PR"),
+                    "dataSourceUrl": proposal.get("data_source_url", ""),
+                    "evaluationLogic": proposal.get("evaluation_logic", {}),
+                    "sourcePrNumber": proposal.get("source_pr_number"),
+                    "sourcePrUrl": proposal.get("source_pr_url"),
+                    "tssScore": proposal.get("tss_score"),
+                    "initialLiquidityEth": receipt.get("initial_liquidity_eth"),
+                    "resolutionDeadline": deadline_dt,
+                    "status": "OPEN",
+                    "outcome": "UNRESOLVED",
+                }
+            )
+
+            # Also record the deployed PR to replace .deployed_prs.json
+            pr_number = proposal.get("source_pr_number")
+            if pr_number:
+                await db.deployedpr.upsert(
+                    where={"prNumber": int(pr_number)},
+                    data={
+                        "create": {
+                            "prNumber": int(pr_number),
+                            "prTitle": proposal.get("title", "")[:200],
+                            "prUrl": proposal.get("source_pr_url"),
+                            "tssScore": proposal.get("tss_score"),
+                            "marketId": market.id,
+                        },
+                        "update": {"marketId": market.id},
+                    },
+                )
+
+            log.info(
+                "Saved market to DB: id=%s onchain_id=%s pr=#%s",
+                market.id, onchain_id, pr_number,
+            )
+            return market
+
+        except Exception as exc:
+            log.error("Failed to save market proposal to DB: %s", exc)
+            return None
