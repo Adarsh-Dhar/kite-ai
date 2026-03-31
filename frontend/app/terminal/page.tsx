@@ -47,11 +47,16 @@ function parseLog(raw: string): ParsedLog {
   // Try to extract time and logger name from the standard formatter
   // Format: [HH:MM:SS] [logger_name] LEVEL: message
   const match = raw.match(/^\[?(\d{2}:\d{2}:\d{2})\]?\s+\[?([^\]]+)\]?\s+\w+:\s*(.*)$/)
+  // For system/initial logs, use a fixed time string to avoid hydration mismatch
+  function getDeterministicTimeString() {
+    // If it's a system message (not matching the log format), use '--:--:--'
+    return '--:--:--';
+  }
   return {
     id: ++_idSeq,
     raw,
     level,
-    time: match?.[1] ?? new Date().toLocaleTimeString(),
+    time: match?.[1] ?? getDeterministicTimeString(),
     name: match?.[2]?.trim() ?? 'agent',
     message: match?.[3]?.trim() ?? raw,
   }

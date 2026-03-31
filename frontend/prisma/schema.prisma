@@ -8,9 +8,6 @@ datasource db {
   provider = "postgresql"
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-//  Enums
-// ─────────────────────────────────────────────────────────────────────────────
 
 enum MarketStatus {
   OPEN
@@ -62,14 +59,6 @@ model Market {
   resolutionType    ResolutionType @map("resolution_type")
   dataSourceUrl     String         @map("data_source_url") @db.Text
   evaluationLogic   Json           @map("evaluation_logic")
-  // evaluationLogic shape varies by ResolutionType:
-  //   GITHUB_PR:      { "check": "merged", "field": "mergedAt", "deadline": ISO8601 }
-  //   GITHUB_RELEASE: { "tag_pattern": "v2.1.*", "deadline": ISO8601 }
-  //   CI_METRIC:      { "metric": "coverage_delta", "operator": ">=", "threshold": 2.0, "artifact_name": "coverage-report.json" }
-  //   CVE_SECURITY:   { "severity": "CRITICAL", "package": "agave-consensus", "deadline": ISO8601 }
-  //   WEB3_RPC:       { "method": "eth_getLogs", "address": "0x...", "event_sig": "0x...", "threshold": 10000 }
-  //   DAO_GOVERNANCE: { "proposal_id": "0x...", "endpoint": "https://hub.snapshot.org/graphql", "quorum": 0.66 }
-  //   LLM_JUDGE:      { "fetch_urls": ["..."], "question": "Did X happen?", "uncertainty_action": "INVALID" }
 
   // Source PR metadata
   sourcePrNumber    Int?           @map("source_pr_number")
@@ -121,7 +110,8 @@ model DeployedPR {
   tssScore    Float?    @map("tss_score")
   deployedAt  DateTime  @default(now()) @map("deployed_at")
 
-  // New: repoName for grouping/filtering by repository
+  // ── NEW: repo name for Explore page aggregation ─────────────────────────
+  // e.g. "anza-xyz/agave" or "ethereum/go-ethereum"
   repoName    String?   @map("repo_name")
 
   // Link to the market created for this PR
@@ -129,6 +119,7 @@ model DeployedPR {
   market      Market?   @relation(fields: [marketId], references: [id])
 
   @@index([prNumber])
+  @@index([repoName])
   @@map("deployed_prs")
 }
 
@@ -142,16 +133,13 @@ model ResolutionLog {
   market        Market    @relation(fields: [marketId], references: [id])
 
   attemptNumber Int       @map("attempt_number")
-  resolverType  String    @map("resolver_type")  // e.g. "GITHUB_PR", "LLM_JUDGE"
+  resolverType  String    @map("resolver_type")
 
-  // What the resolver fetched
   rawResponse   Json?     @map("raw_response")
 
-  // Decision
   decision      String    // "YES", "NO", "INVALID", "PENDING", "ERROR"
   reasoning     String?   @db.Text
 
-  // On-chain outcome (if pushed)
   txHash        String?   @map("tx_hash")
   blockNumber   Int?      @map("block_number")
 

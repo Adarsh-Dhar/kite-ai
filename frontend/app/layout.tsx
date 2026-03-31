@@ -10,11 +10,6 @@ export const metadata: Metadata = {
   title: 'The Pulse - BTC Prediction Markets',
   description: 'Real-time crypto trading command center. Predict Bitcoin levels, earn money with friends and collaborators.',
   generator: 'v0.app',
-  viewport: {
-    width: 'device-width',
-    initialScale: 1,
-    maximumScale: 5,
-  },
   icons: {
     icon: [
       {
