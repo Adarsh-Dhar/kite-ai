@@ -37,10 +37,24 @@ logging.basicConfig(
 )
 log = logging.getLogger("market_architect")
 
-# ── App-level singletons ──────────────────────────────────────────────────────
+
+# ── App-level singletons ─────────────────────────────────────────────────────
 settings = Settings()  # type: ignore[call-arg]
 _http_client: httpx.AsyncClient | None = None
 _kite_client: KiteClient | None = None
+
+# ── Market metadata DB (market_id → proposal/meta) ──
+import os, json
+_MARKET_DB_PATH = os.path.join(os.path.dirname(__file__), 'market_db.json')
+def _load_market_db():
+    if os.path.exists(_MARKET_DB_PATH):
+        with open(_MARKET_DB_PATH) as f:
+            return json.load(f)
+    return {}
+def _save_market_db(db):
+    with open(_MARKET_DB_PATH, 'w') as f:
+        json.dump(db, f)
+_market_db = _load_market_db()
 
 # ── Live agent state (in-memory, for /status endpoint) ───────────────────────
 _agent_state: dict[str, Any] = {
@@ -60,9 +74,10 @@ _agent_state: dict[str, Any] = {
 
 # ── Lifespan: start/stop background scout loop ───────────────────────────────
 
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _http_client, _kite_client, _agent_state
+    global _http_client, _kite_client, _agent_state, _market_db
 
     _http_client = httpx.AsyncClient(timeout=30.0)
     _kite_client = KiteClient(
@@ -90,13 +105,22 @@ async def lifespan(app: FastAPI):
     # Start the continuous scouting loop
     scout_task = asyncio.create_task(_continuous_scout_loop())
 
+    # Start the resolver loop
+    from agents import resolver
+    resolver_task = asyncio.create_task(resolver.continuous_resolver_loop(_kite_client, _market_db))
+
     yield
 
     # Shutdown
     _agent_state["loop_running"] = False
     scout_task.cancel()
+    resolver_task.cancel()
     try:
         await scout_task
+    except asyncio.CancelledError:
+        pass
+    try:
+        await resolver_task
     except asyncio.CancelledError:
         pass
     await _http_client.aclose()
@@ -247,7 +271,8 @@ async def _run_full_cycle(
     _agent_state["total_markets_proposed"] += len(proposals)
     log.info("Generated %d market proposals.", len(proposals))
 
-    # ── 4. Deploy on-chain ────────────────────────────────────────────────────
+
+    # ── 4. Deploy on-chain ───────────────────────────────────────────────
     if not dry_run and proposals:
         for proposal in proposals:
             try:
@@ -259,6 +284,11 @@ async def _run_full_cycle(
                     **receipt,
                     "market_title": receipt.get("market_title", "")[:80],
                 })
+                # Store proposal/meta by market_id for resolver
+                market_id = receipt.get("market_id")
+                if market_id:
+                    _market_db[str(market_id)] = proposal
+                    _save_market_db(_market_db)
                 log.info(
                     "✅ Market deployed: '%s' | tx=%s | block=%s",
                     receipt.get("market_title", "")[:50],

@@ -77,6 +77,8 @@ Generate a JSON object with these exact keys:
 2. "description" — A binary Yes/No prediction question about a concrete, verifiable future outcome related to this PR's deployment or impact. Be specific about timelines or metrics where possible.
 3. "options" — Always exactly ["Yes", "No"]
 4. "agent_reason" — 2-3 sentences explaining: (a) what this PR changes at a technical level, (b) why it's market-worthy, and (c) what evidence would resolve the market.
+5. "resolution_endpoint" — The GitHub API URL for this PR (e.g., https://api.github.com/repos/anza-xyz/agave/pulls/11532)
+6. "resolution_condition" — A deterministic rule for resolving the market, e.g.: "If merged==true → YES. If state==closed AND merged==false → NO. Past deadline → NO."
 
 Respond with ONLY valid JSON. No markdown fences, no preamble.
 """
@@ -163,6 +165,12 @@ class MarketArchitect:
         proposal["tss_score"] = pr.get("tss_score", 0.0)
         proposal["source_pr_number"] = pr.get("number")
         proposal["source_pr_url"] = pr.get("url")
+        # Add resolution_endpoint and resolution_condition if not present (fallback)
+        if "resolution_endpoint" not in proposal:
+            pr_number = pr.get("number")
+            proposal["resolution_endpoint"] = f"https://api.github.com/repos/anza-xyz/agave/pulls/{pr_number}" if pr_number else ""
+        if "resolution_condition" not in proposal:
+            proposal["resolution_condition"] = "If merged==true → YES. If state==closed AND merged==false → NO. Past deadline → NO."
         return proposal
 
     def _build_prompt(self, pr: dict[str, Any]) -> str:
@@ -207,7 +215,7 @@ class MarketArchitect:
     def _parse_llm_response(raw: str) -> dict[str, Any]:
         cleaned = re.sub(r"```json|```", "", raw).strip()
         data = json.loads(cleaned)
-        required = {"title", "description", "options", "agent_reason"}
+        required = {"title", "description", "options", "agent_reason", "resolution_endpoint", "resolution_condition"}
         missing = required - data.keys()
         if missing:
             raise ValueError(f"LLM response missing keys: {missing}")
@@ -232,4 +240,6 @@ class MarketArchitect:
                 f"touches core Solana validator code. Labels: {labels}. "
                 f"Fallback proposal — LLM service unavailable."
             ),
+            "resolution_endpoint": f"https://api.github.com/repos/anza-xyz/agave/pulls/{number}",
+            "resolution_condition": "If merged==true → YES. If state==closed AND merged==false → NO. Past deadline → NO."
         }

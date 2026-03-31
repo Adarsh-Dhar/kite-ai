@@ -56,6 +56,46 @@ class MarketDeploymentReceipt:
 # ── Kite AI Client ────────────────────────────────────────────────────────────
 
 class KiteClient:
+        async def resolve_onchain_market(self, market_id: int, outcome: str) -> dict[str, Any]:
+            """
+            Resolve a market on-chain by calling resolveMarket(marketId, outcome).
+            Outcome must be one of: YES, NO, INVALID (mapped to contract enum).
+            """
+            outcome_map = {"YES": 1, "NO": 2, "INVALID": 3}
+            if outcome not in outcome_map:
+                raise ValueError(f"Invalid outcome: {outcome}")
+            if not self.is_ready():
+                log.warning("KiteClient not fully configured — mock resolve.")
+                return {"mock": True, "market_id": market_id, "outcome": outcome}
+            try:
+                w3 = await self._get_w3()
+                contract = w3.eth.contract(
+                    address=Web3.to_checksum_address(self._contract_address),
+                    abi=self._contract_abi,
+                )
+                checksum_wallet = Web3.to_checksum_address(self._wallet_address)
+                nonce = await w3.eth.get_transaction_count(checksum_wallet)
+                gas_price = await w3.eth.gas_price
+                tx = await contract.functions.resolveMarket(
+                    int(market_id), outcome_map[outcome]
+                ).build_transaction({
+                    "from": checksum_wallet,
+                    "nonce": nonce,
+                    "gas": 200_000,
+                    "gasPrice": gas_price,
+                    "chainId": self._chain_id,
+                })
+                account = Account.from_key(self._private_key)
+                signed = account.sign_transaction(tx)
+                tx_hash = await w3.eth.send_raw_transaction(signed.raw_transaction)
+                log.info(f"resolveMarket tx sent: {tx_hash.hex()} for market {market_id} outcome {outcome}")
+                receipt = await w3.eth.wait_for_transaction_receipt(tx_hash, timeout=60)
+                if receipt["status"] == 0:
+                    raise RuntimeError(f"Transaction reverted. Hash: {tx_hash.hex()}")
+                return {"market_id": market_id, "outcome": outcome, "tx_hash": tx_hash.hex(), "block_number": receipt["blockNumber"]}
+            except Exception as exc:
+                log.error(f"Failed to resolve market {market_id}: {exc}")
+                raise
     """
     Async Kite AI blockchain client — real web3.py implementation.
 
