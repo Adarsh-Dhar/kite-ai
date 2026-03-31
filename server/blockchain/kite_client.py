@@ -95,7 +95,7 @@ class KiteClient:
         Load already-deployed PR numbers from Prisma at startup.
         """
         from db import db
-        records = await db.deployedpr.find_many(select={"prNumber": True})
+        records = await db.deployedpr.find_many()
         self._deployed_prs_cache = {r.prNumber for r in records}
         log.info(
             "Synced %d deployed PRs from DB.", len(self._deployed_prs_cache)

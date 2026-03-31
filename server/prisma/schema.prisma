@@ -2,20 +2,14 @@ generator py {
   provider                    = "prisma-client-py"
   interface                   = "asyncio"
   enable_experimental_decimal = true
-  output                      = "../server/lib/generated/client"
+  output                      = "./prisma"
   recursive_type_depth        = 5
   engineType                  = "binary"
 }
 
-generator client {
-  provider = "prisma-client-js"
-  output   = "../frontend/lib/generated/client"
-}
-
-
 datasource db {
   provider = "postgresql"
-  url= env("DATABASE_URL")
+  url      = env("DATABASE_URL")
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -38,14 +32,14 @@ enum Outcome {
 }
 
 enum ResolutionType {
-  GITHUB_PR          // Resolved by checking PR merged state via GitHub API
-  GITHUB_RELEASE     // Resolved by checking for a release tag
-  GITHUB_ISSUE       // Resolved by checking issue state
-  CI_METRIC          // Resolved by parsing CI/CD check run artifacts
-  CVE_SECURITY       // Resolved by monitoring GitHub Security Advisories / NVD
-  WEB3_RPC           // Resolved by querying on-chain data via RPC
-  DAO_GOVERNANCE     // Resolved by querying Snapshot or on-chain vote counts
-  LLM_JUDGE          // Fallback: resolved by an LLM evaluating fetched text
+  GITHUB_PR // Resolved by checking PR merged state via GitHub API
+  GITHUB_RELEASE // Resolved by checking for a release tag
+  GITHUB_ISSUE // Resolved by checking issue state
+  CI_METRIC // Resolved by parsing CI/CD check run artifacts
+  CVE_SECURITY // Resolved by monitoring GitHub Security Advisories / NVD
+  WEB3_RPC // Resolved by querying on-chain data via RPC
+  DAO_GOVERNANCE // Resolved by querying Snapshot or on-chain vote counts
+  LLM_JUDGE // Fallback: resolved by an LLM evaluating fetched text
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -53,25 +47,25 @@ enum ResolutionType {
 // ─────────────────────────────────────────────────────────────────────────────
 
 model Market {
-  id                String         @id @default(cuid())
+  id String @id @default(cuid())
 
   // On-chain identifiers
-  onchainMarketId   Int?           @unique @map("onchain_market_id")
-  transactionHash   String?        @unique @map("transaction_hash")
-  blockNumber       Int?           @map("block_number")
-  contractAddress   String?        @map("contract_address")
+  onchainMarketId Int?    @unique @map("onchain_market_id")
+  transactionHash String? @unique @map("transaction_hash")
+  blockNumber     Int?    @map("block_number")
+  contractAddress String? @map("contract_address")
 
   // Market content
-  title             String
-  question          String         @db.Text
-  category          String
-  options           String[]       @default(["Yes", "No"])
-  agentReason       String         @db.Text @map("agent_reason")
+  title       String
+  question    String   @db.Text
+  category    String
+  options     String[] @default(["Yes", "No"])
+  agentReason String   @map("agent_reason") @db.Text
 
   // Resolution strategy (the "Golden Rule" — deterministic and machine-readable)
-  resolutionType    ResolutionType @map("resolution_type")
-  dataSourceUrl     String         @map("data_source_url") @db.Text
-  evaluationLogic   Json           @map("evaluation_logic")
+  resolutionType  ResolutionType @map("resolution_type")
+  dataSourceUrl   String         @map("data_source_url") @db.Text
+  evaluationLogic Json           @map("evaluation_logic")
   // evaluationLogic shape varies by ResolutionType:
   //   GITHUB_PR:      { "check": "merged", "field": "mergedAt", "deadline": ISO8601 }
   //   GITHUB_RELEASE: { "tag_pattern": "v2.1.*", "deadline": ISO8601 }
@@ -82,34 +76,34 @@ model Market {
   //   LLM_JUDGE:      { "fetch_urls": ["..."], "question": "Did X happen?", "uncertainty_action": "INVALID" }
 
   // Source PR metadata
-  sourcePrNumber    Int?           @map("source_pr_number")
-  sourcePrUrl       String?        @map("source_pr_url")
-  tssScore          Float?         @map("tss_score")
+  sourcePrNumber Int?    @map("source_pr_number")
+  sourcePrUrl    String? @map("source_pr_url")
+  tssScore       Float?  @map("tss_score")
 
   // Market status
-  status            MarketStatus   @default(OPEN)
-  outcome           Outcome        @default(UNRESOLVED)
-  resolvedAt        DateTime?      @map("resolved_at")
-  resolutionTxHash  String?        @map("resolution_tx_hash")
-  resolutionNote    String?        @db.Text @map("resolution_note")
+  status           MarketStatus @default(OPEN)
+  outcome          Outcome      @default(UNRESOLVED)
+  resolvedAt       DateTime?    @map("resolved_at")
+  resolutionTxHash String?      @map("resolution_tx_hash")
+  resolutionNote   String?      @map("resolution_note") @db.Text
 
   // Financials (mirrors on-chain state, cached for analytics)
-  initialLiquidityEth Float?       @map("initial_liquidity_eth")
-  resolutionDeadline  DateTime?    @map("resolution_deadline")
+  initialLiquidityEth Float?    @map("initial_liquidity_eth")
+  resolutionDeadline  DateTime? @map("resolution_deadline")
 
   // Resolver retry tracking
-  resolveAttempts   Int            @default(0) @map("resolve_attempts")
-  lastAttemptAt     DateTime?      @map("last_attempt_at")
-  nextRetryAt       DateTime?      @map("next_retry_at")
-  lastError         String?        @db.Text @map("last_error")
+  resolveAttempts Int       @default(0) @map("resolve_attempts")
+  lastAttemptAt   DateTime? @map("last_attempt_at")
+  nextRetryAt     DateTime? @map("next_retry_at")
+  lastError       String?   @map("last_error") @db.Text
 
   // Timestamps
-  createdAt         DateTime       @default(now()) @map("created_at")
-  updatedAt         DateTime       @updatedAt @map("updated_at")
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
 
   // Relations
-  resolutionLogs    ResolutionLog[]
-  prRecord          DeployedPR?
+  resolutionLogs ResolutionLog[]
+  prRecord       DeployedPR?
 
   @@index([status])
   @@index([resolutionType])
@@ -123,17 +117,17 @@ model Market {
 // ─────────────────────────────────────────────────────────────────────────────
 
 model DeployedPR {
-  id          String    @id @default(cuid())
-  prNumber    Int       @unique @map("pr_number")
-  prTitle     String    @map("pr_title")
-  prUrl       String?   @map("pr_url")
-  mergedAt    DateTime? @map("merged_at")
-  tssScore    Float?    @map("tss_score")
-  deployedAt  DateTime  @default(now()) @map("deployed_at")
+  id         String    @id @default(cuid())
+  prNumber   Int       @unique @map("pr_number")
+  prTitle    String    @map("pr_title")
+  prUrl      String?   @map("pr_url")
+  mergedAt   DateTime? @map("merged_at")
+  tssScore   Float?    @map("tss_score")
+  deployedAt DateTime  @default(now()) @map("deployed_at")
 
   // Link to the market created for this PR
-  marketId    String?   @unique @map("market_id")
-  market      Market?   @relation(fields: [marketId], references: [id])
+  marketId String? @unique @map("market_id")
+  market   Market? @relation(fields: [marketId], references: [id])
 
   @@index([prNumber])
   @@map("deployed_prs")
@@ -144,26 +138,26 @@ model DeployedPR {
 // ─────────────────────────────────────────────────────────────────────────────
 
 model ResolutionLog {
-  id            String    @id @default(cuid())
-  marketId      String    @map("market_id")
-  market        Market    @relation(fields: [marketId], references: [id])
+  id       String @id @default(cuid())
+  marketId String @map("market_id")
+  market   Market @relation(fields: [marketId], references: [id])
 
-  attemptNumber Int       @map("attempt_number")
-  resolverType  String    @map("resolver_type")  // e.g. "GITHUB_PR", "LLM_JUDGE"
+  attemptNumber Int    @map("attempt_number")
+  resolverType  String @map("resolver_type") // e.g. "GITHUB_PR", "LLM_JUDGE"
 
   // What the resolver fetched
-  rawResponse   Json?     @map("raw_response")
+  rawResponse Json? @map("raw_response")
 
   // Decision
-  decision      String    // "YES", "NO", "INVALID", "PENDING", "ERROR"
-  reasoning     String?   @db.Text
+  decision  String // "YES", "NO", "INVALID", "PENDING", "ERROR"
+  reasoning String? @db.Text
 
   // On-chain outcome (if pushed)
-  txHash        String?   @map("tx_hash")
-  blockNumber   Int?      @map("block_number")
+  txHash      String? @map("tx_hash")
+  blockNumber Int?    @map("block_number")
 
-  error         String?   @db.Text
-  attemptedAt   DateTime  @default(now()) @map("attempted_at")
+  error       String?  @db.Text
+  attemptedAt DateTime @default(now()) @map("attempted_at")
 
   @@index([marketId])
   @@index([attemptedAt])
@@ -175,19 +169,19 @@ model ResolutionLog {
 // ─────────────────────────────────────────────────────────────────────────────
 
 model AgentCycle {
-  id                  String    @id @default(cuid())
-  cycleType           String    @map("cycle_type")  // "SCOUT" | "RESOLVER"
-  startedAt           DateTime  @default(now()) @map("started_at")
-  completedAt         DateTime? @map("completed_at")
-  durationMs          Int?      @map("duration_ms")
+  id          String    @id @default(cuid())
+  cycleType   String    @map("cycle_type") // "SCOUT" | "RESOLVER"
+  startedAt   DateTime  @default(now()) @map("started_at")
+  completedAt DateTime? @map("completed_at")
+  durationMs  Int?      @map("duration_ms")
 
-  prsAnalysed         Int?      @default(0) @map("prs_analysed")
-  marketsProposed     Int?      @default(0) @map("markets_proposed")
-  marketsDeployed     Int?      @default(0) @map("markets_deployed")
-  marketsResolved     Int?      @default(0) @map("markets_resolved")
+  prsAnalysed     Int? @default(0) @map("prs_analysed")
+  marketsProposed Int? @default(0) @map("markets_proposed")
+  marketsDeployed Int? @default(0) @map("markets_deployed")
+  marketsResolved Int? @default(0) @map("markets_resolved")
 
-  errors              String[]  @default([])
-  metadata            Json?
+  errors   String[] @default([])
+  metadata Json?
 
   @@index([cycleType])
   @@index([startedAt])
@@ -199,15 +193,15 @@ model AgentCycle {
 // ─────────────────────────────────────────────────────────────────────────────
 
 model SecurityAdvisory {
-  id            String    @id @default(cuid())
-  cveId         String?   @unique @map("cve_id")
-  ghsaId        String?   @unique @map("ghsa_id")
-  severity      String    // CRITICAL, HIGH, MEDIUM, LOW
-  packageName   String?   @map("package_name")
-  summary       String?   @db.Text
-  publishedAt   DateTime? @map("published_at")
-  rawPayload    Json?     @map("raw_payload")
-  fetchedAt     DateTime  @default(now()) @map("fetched_at")
+  id          String    @id @default(cuid())
+  cveId       String?   @unique @map("cve_id")
+  ghsaId      String?   @unique @map("ghsa_id")
+  severity    String // CRITICAL, HIGH, MEDIUM, LOW
+  packageName String?   @map("package_name")
+  summary     String?   @db.Text
+  publishedAt DateTime? @map("published_at")
+  rawPayload  Json?     @map("raw_payload")
+  fetchedAt   DateTime  @default(now()) @map("fetched_at")
 
   @@index([severity])
   @@index([publishedAt])
