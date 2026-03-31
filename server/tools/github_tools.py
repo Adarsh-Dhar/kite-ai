@@ -42,6 +42,9 @@ class GitHubTools:
     """
 
     def __init__(self, http_client: httpx.AsyncClient, github_token: str) -> None:
+        if not github_token or not github_token.strip():
+            log.error("GitHubTools: GITHUB_TOKEN is missing. Please set it in your .env file.")
+            raise ValueError("Missing GitHub Personal Access Token (GITHUB_TOKEN) in environment.")
         self._client = http_client
         self._headers = {
             "Authorization": f"Bearer {github_token}",

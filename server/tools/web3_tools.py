@@ -48,6 +48,9 @@ class Web3Tools:
             self._rpc_url = Settings().kite_rpc_url
         else:
             self._rpc_url = rpc_url
+        if not self._rpc_url or not self._rpc_url.strip():
+            log.error("Web3Tools: KITE_RPC_URL (or provided RPC URL) is missing. Please set it in your .env file.")
+            raise ValueError("Missing RPC URL for Web3Tools (KITE_RPC_URL) in environment.")
         self._w3: Any | None = None
 
     async def _get_w3(self) -> Any:

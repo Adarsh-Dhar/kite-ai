@@ -34,7 +34,9 @@ class SecurityTools:
 
     def __init__(self, http_client: httpx.AsyncClient, nvd_api_key: str = "") -> None:
         self._client = http_client
-        self._nvd_api_key = nvd_api_key  # Optional — increases NVD rate limits
+        self._nvd_api_key = nvd_api_key or ""
+        if not self._nvd_api_key:
+            log.warning("SecurityTools: NVD_API_KEY is not set. NVD API requests may be rate-limited. Set NVD_API_KEY in your .env for higher limits.")
 
     # ── NVD CVE Database ──────────────────────────────────────────────────────
 

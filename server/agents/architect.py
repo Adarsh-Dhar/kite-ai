@@ -220,21 +220,68 @@ class MarketArchitect:
 
     # ── Market Generation ─────────────────────────────────────────────────────
 
-    async def generate_market_proposal(self, pr: dict[str, Any]) -> dict[str, Any]:
-        prompt = self._build_prompt(pr)
-        try:
-            if not self._llm_api_key:
-                raise ValueError("LLM_API_KEY not set — using fallback.")
-            raw_json = await self._call_llm(prompt)
-            proposal = self._parse_llm_response(raw_json)
-        except Exception as exc:
-            log.warning("LLM call failed (%s). Using fallback.", exc)
-            proposal = self._fallback_proposal(pr)
 
-        proposal["tss_score"] = pr.get("tss_score", 0.0)
-        proposal["source_pr_number"] = pr.get("number")
-        proposal["source_pr_url"] = pr.get("url")
-        return proposal
+    async def generate_market_proposal(self, pr: dict[str, Any], max_retries: int = 3) -> dict[str, Any]:
+        """
+        Generate a market proposal and verify its data_source_url before returning.
+        If the URL is invalid/unreachable, retry up to max_retries times.
+        """
+        for attempt in range(max_retries):
+            prompt = self._build_prompt(pr)
+            try:
+                if not self._llm_api_key:
+                    raise ValueError("LLM_API_KEY not set — using fallback.")
+                raw_json = await self._call_llm(prompt)
+                proposal = self._parse_llm_response(raw_json)
+            except Exception as exc:
+                log.warning("LLM call failed (%s). Using fallback.", exc)
+                proposal = self._fallback_proposal(pr)
+
+            proposal["tss_score"] = pr.get("tss_score", 0.0)
+            proposal["source_pr_number"] = pr.get("number")
+            proposal["source_pr_url"] = pr.get("url")
+
+            # Pre-deployment verification step
+            ok, err = await self.verify_data_source_url(proposal)
+            if ok:
+                return proposal
+            log.warning(f"[MarketArchitect] data_source_url verification failed (attempt {attempt+1}/{max_retries}): {err}")
+        raise RuntimeError(f"Failed to generate a valid market proposal after {max_retries} attempts: last error: {err}")
+
+    async def verify_data_source_url(self, proposal: dict[str, Any]) -> tuple[bool, str]:
+        """
+        Verifies that the data_source_url in the proposal is reachable and returns 200 OK (or is a valid RPC endpoint).
+        Returns (True, "") if valid, else (False, error_message).
+        """
+        url = proposal.get("data_source_url")
+        if not url or not isinstance(url, str):
+            return False, "Missing or invalid data_source_url"
+
+        # HTTP(S) endpoints: check for 200 OK
+        if url.startswith("http://") or url.startswith("https://"):
+            try:
+                async with httpx.AsyncClient(timeout=10.0) as client:
+                    resp = await client.get(url)
+                    if resp.status_code == 200:
+                        return True, ""
+                    return False, f"HTTP status {resp.status_code} for {url}"
+            except Exception as exc:
+                return False, f"HTTP error for {url}: {exc}"
+
+        # Web3/RPC endpoints: try a basic JSON-RPC call
+        if url.startswith("ws://") or url.startswith("wss://") or "/rpc" in url:
+            try:
+                # Try a basic POST to check if endpoint is alive
+                async with httpx.AsyncClient(timeout=10.0) as client:
+                    resp = await client.post(url, json={"jsonrpc": "2.0", "id": 1, "method": "web3_clientVersion", "params": []})
+                    if resp.status_code == 200:
+                        return True, ""
+                    return False, f"RPC status {resp.status_code} for {url}"
+            except Exception as exc:
+                return False, f"RPC error for {url}: {exc}"
+
+        # Fallback: treat as invalid
+        return False, f"Unrecognized or unsupported data_source_url: {url}"
 
     def _build_prompt(self, pr: dict[str, Any]) -> str:
         key_files = ", ".join(pr.get("changed_files", [])[:10]) or "N/A"

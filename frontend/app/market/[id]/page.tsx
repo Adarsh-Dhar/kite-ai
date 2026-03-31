@@ -4,7 +4,7 @@ import { DashboardLayout } from '@/components/dashboard-layout';
 import { MarketChart } from '@/components/market-chart';
 import { ChevronLeft } from 'lucide-react';
 import Link from 'next/link';
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 
 // Mock price history data
 const generatePriceData = () => {
@@ -24,6 +24,27 @@ const priceData = generatePriceData();
 
 export default function MarketPage({ params }: { params: { id: string } }) {
   const [betAmount, setBetAmount] = useState('15.00');
+  const [market, setMarket] = useState<any>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    async function fetchMarket() {
+      setLoading(true);
+      setError(null);
+      try {
+        const resp = await fetch(`/api/market/${params.id}`);
+        if (!resp.ok) throw new Error('Market not found');
+        const data = await resp.json();
+        setMarket(data);
+      } catch (err: any) {
+        setError(err.message || 'Failed to load market');
+      } finally {
+        setLoading(false);
+      }
+    }
+    fetchMarket();
+  }, [params.id]);
 
   const deals = [
     { id: 1, user: 'alice_trader', amount: 500, outcome: 'Win', timestamp: '2m ago' },
@@ -32,6 +53,9 @@ export default function MarketPage({ params }: { params: { id: string } }) {
     { id: 4, user: 'whale_watch', amount: 750, outcome: 'Loss', timestamp: '18m ago' },
     { id: 5, user: 'market_maker', amount: 2000, outcome: 'Win', timestamp: '25m ago' },
   ];
+
+  if (loading) return <div className="text-center text-white py-20">Loading market...</div>;
+  if (error) return <div className="text-center text-red-500 py-20">{error}</div>;
 
   return (
     <DashboardLayout>
@@ -104,23 +128,32 @@ export default function MarketPage({ params }: { params: { id: string } }) {
                 <ul className="space-y-2">
                   <li className="flex gap-3 text-[#888888]">
                     <span className="text-[#00ff00] font-bold">•</span>
-                    <span>Resolution date: March 31, 2026, 23:59 UTC</span>
+                    <span>
+                      <b>Resolution Type:</b> {market?.resolution_type || '—'}
+                    </span>
                   </li>
                   <li className="flex gap-3 text-[#888888]">
                     <span className="text-[#00ff00] font-bold">•</span>
-                    <span>Price source: CoinGecko API (BTC/USD pair)</span>
+                    <span>
+                      <b>Data Source URL:</b> {market?.data_source_url ? (
+                        <a href={market.data_source_url} target="_blank" rel="noopener noreferrer" className="text-[#00ff00] underline break-all">{market.data_source_url}</a>
+                      ) : '—'}
+                    </span>
                   </li>
                   <li className="flex gap-3 text-[#888888]">
                     <span className="text-[#00ff00] font-bold">•</span>
-                    <span>Resolution oracle: Chainlink Price Feed</span>
+                    <span>
+                      <b>Evaluation Logic:</b>
+                      <pre className="bg-[#181818] rounded p-2 mt-1 text-xs text-[#00ff00] whitespace-pre-wrap overflow-x-auto max-w-full">
+                        {market?.evaluation_logic ? JSON.stringify(market.evaluation_logic, null, 2) : '—'}
+                      </pre>
+                    </span>
                   </li>
                   <li className="flex gap-3 text-[#888888]">
                     <span className="text-[#00ff00] font-bold">•</span>
-                    <span>Winning side: BTC closing above $30,000</span>
-                  </li>
-                  <li className="flex gap-3 text-[#888888]">
-                    <span className="text-[#00ff00] font-bold">•</span>
-                    <span>Maximum bet per user: $10,000 USD equivalent</span>
+                    <span>
+                      <b>Resolution Condition:</b> {market?.resolution_condition || '—'}
+                    </span>
                   </li>
                 </ul>
               </div>
