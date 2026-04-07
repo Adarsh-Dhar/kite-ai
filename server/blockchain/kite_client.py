@@ -5,18 +5,17 @@ Real implementation using web3.py to interact with the KitePredictionMarket
 contract deployed on the Kite AI testnet (chainId 2368).
 
 Changes in v2:
-  • _load_deployed_prs / _save_deployed_prs now use Prisma DB instead of JSON file
-  • already_deployed() queries the DB
-  • get_all_open_markets() added for resolver agent
-  • resolve_onchain_market() kept and cleaned up
+    • _load_deployed_prs / _save_deployed_prs now use Prisma DB instead of JSON file
+    • already_deployed() queries the DB
+    • get_all_open_markets() added for resolver agent
+    • resolve_onchain_market() kept and cleaned up
+    • server-side deployment was removed; wallet-signed deployment now happens in the frontend
 """
 
 from __future__ import annotations
 
 import json
 import logging
-import os
-import time
 from pathlib import Path
 from typing import Any
 
@@ -134,6 +133,8 @@ class KiteClient:
             )
             market_count = await contract.functions.marketCount().call()
             fee_bps = await contract.functions.platformFeeBps().call()
+            treasury = await contract.functions.treasuryAddress().call()
+            service_fee = await contract.functions.serviceFee().call()
             owner = await contract.functions.owner().call()
             balance = await w3.eth.get_balance(
                 Web3.to_checksum_address(self._wallet_address)
@@ -141,6 +142,8 @@ class KiteClient:
             return {
                 "market_count": market_count,
                 "platform_fee_bps": fee_bps,
+                "treasury_address": treasury,
+                "service_fee_wei": service_fee,
                 "owner": owner,
                 "wallet_address": self._wallet_address,
                 "wallet_balance_eth": balance / 1e18,
@@ -174,31 +177,6 @@ class KiteClient:
         except Exception as exc:
             log.error("get_all_open_markets DB error: %s", exc)
             return []
-
-    async def create_onchain_market(
-        self,
-        market_data: dict[str, Any],
-    ) -> dict[str, Any]:
-        """Deploy a prediction market on the Kite AI blockchain."""
-        pr_number = market_data.get("source_pr_number", 0)
-        title = market_data.get("title", "Untitled")
-
-        if pr_number and self.already_deployed(pr_number):
-            log.info("PR #%s already deployed — skipping.", pr_number)
-            return {"skipped": True, "reason": f"PR #{pr_number} already deployed"}
-
-        if not self.is_ready():
-            log.warning("KiteClient not fully configured — using mock deployment.")
-            return self._mock_receipt(market_data)
-
-        try:
-            receipt = await self._deploy_market(market_data)
-            if pr_number:
-                await self.mark_deployed(pr_number)
-            return receipt
-        except Exception as exc:
-            log.error("On-chain market deployment failed for '%s': %s", title, exc)
-            raise RuntimeError(f"Deployment failed: {exc}") from exc
 
     async def resolve_onchain_market(
         self, market_id: int, outcome: str
@@ -265,120 +243,6 @@ class KiteClient:
             self._w3 = AsyncWeb3(AsyncWeb3.AsyncHTTPProvider(self._rpc_url))
             self._w3.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
         return self._w3
-
-    async def _deploy_market(self, market_data: dict[str, Any]) -> dict[str, Any]:
-        w3 = await self._get_w3()
-        checksum_contract = Web3.to_checksum_address(self._contract_address)
-        checksum_wallet = Web3.to_checksum_address(self._wallet_address)
-        contract = w3.eth.contract(address=checksum_contract, abi=self._contract_abi)
-
-        question = (market_data.get("description") or market_data.get("title", "?"))[:300]
-        category = self._infer_category(market_data)
-        oracle = checksum_wallet
-        deadline = int(time.time()) + self._resolution_days * 86400
-
-        log.info(
-            "Building createMarket tx | question='%s...' | liquidity=%.4f ETH",
-            question[:60], self._liquidity_wei / 1e18,
-        )
-
-        balance = await w3.eth.get_balance(checksum_wallet)
-        if balance < self._liquidity_wei:
-            raise RuntimeError(
-                f"Insufficient balance: have {balance / 1e18:.4f} KITE, "
-                f"need {self._liquidity_wei / 1e18:.4f} KITE"
-            )
-
-        nonce = await w3.eth.get_transaction_count(checksum_wallet)
-
-        try:
-            gas_estimate = await contract.functions.createMarket(
-                question, category, oracle, deadline
-            ).estimate_gas({"from": checksum_wallet, "value": self._liquidity_wei})
-            gas_limit = int(gas_estimate * 1.3)
-        except Exception as gas_exc:
-            log.warning("Gas estimation failed (%s), using fallback 500_000", gas_exc)
-            gas_limit = 500_000
-
-        gas_price = await w3.eth.gas_price
-
-        tx = await contract.functions.createMarket(
-            question, category, oracle, deadline,
-        ).build_transaction({
-            "from": checksum_wallet,
-            "value": self._liquidity_wei,
-            "nonce": nonce,
-            "gas": gas_limit,
-            "gasPrice": gas_price,
-            "chainId": self._chain_id,
-        })
-
-        account = Account.from_key(self._private_key)
-        signed = account.sign_transaction(tx)
-        tx_hash = await w3.eth.send_raw_transaction(signed.raw_transaction)
-        log.info("Transaction sent: %s — waiting for receipt…", tx_hash.hex())
-
-        raw_receipt = await w3.eth.wait_for_transaction_receipt(tx_hash, timeout=60)
-        if raw_receipt["status"] == 0:
-            raise RuntimeError(f"Transaction reverted. Hash: {tx_hash.hex()}")
-
-        market_id = self._extract_market_id(contract, raw_receipt)
-        log.info(
-            "Market deployed ✓  marketId=%s  tx=%s  block=%d",
-            market_id, tx_hash.hex()[:14] + "…", raw_receipt["blockNumber"],
-        )
-
-        return {
-            "market_id": market_id,
-            "transaction_hash": tx_hash.hex(),
-            "block_number": raw_receipt["blockNumber"],
-            "contract_address": self._contract_address,
-            "initial_liquidity_eth": self._liquidity_wei / 1e18,
-            "deployed_at": int(time.time()),
-            "question": question,
-            "category": category,
-            "oracle": oracle,
-            "resolution_deadline": deadline,
-            "gas_used": raw_receipt["gasUsed"],
-            "market_title": market_data.get("title", ""),
-            "source_pr_number": market_data.get("source_pr_number"),
-            "tss_score": market_data.get("tss_score"),
-        }
-
-    @staticmethod
-    def _extract_market_id(contract: Any, receipt: Any) -> int | None:
-        try:
-            logs = contract.events.MarketCreated().process_receipt(receipt)
-            if logs:
-                return logs[0]["args"]["marketId"]
-        except Exception as exc:
-            log.warning("Could not parse MarketCreated event: %s", exc)
-        return None
-
-    @staticmethod
-    def _mock_receipt(market_data: dict[str, Any]) -> dict[str, Any]:
-        import hashlib
-        title = market_data.get("title", "Untitled")
-        mock_hash = "0x" + hashlib.sha256(title.encode()).hexdigest()
-        mock_addr = "0x" + hashlib.md5(title.encode()).hexdigest()[:40]
-        log.warning("MOCK deployment for '%s'", title)
-        return {
-            "market_id": None,
-            "transaction_hash": mock_hash,
-            "block_number": 14_000_000,
-            "contract_address": mock_addr,
-            "initial_liquidity_eth": 0.05,
-            "deployed_at": int(time.time()),
-            "question": market_data.get("description", ""),
-            "category": KiteClient._infer_category(market_data),
-            "oracle": "0x0000000000000000000000000000000000000000",
-            "resolution_deadline": int(time.time()) + 30 * 86400,
-            "gas_used": 0,
-            "market_title": title,
-            "source_pr_number": market_data.get("source_pr_number"),
-            "tss_score": market_data.get("tss_score"),
-            "mock": True,
-        }
 
     @staticmethod
     def _normalise_key(key: str) -> str:

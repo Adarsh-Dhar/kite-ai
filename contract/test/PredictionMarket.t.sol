@@ -21,6 +21,7 @@ contract PredictionMarketTest is Test {
     KitePredictionMarket public pm;
 
     address owner   = address(this);
+    address treasury = makeAddr("treasury");
     address oracle  = makeAddr("oracle");
     address alice   = makeAddr("alice");
     address bob     = makeAddr("bob");
@@ -31,13 +32,14 @@ contract PredictionMarketTest is Test {
     uint256 constant DEADLINE_OFFSET   = 7 days;
 
     function setUp() public {
-        pm = new KitePredictionMarket(FEE_BPS);
+        pm = new KitePredictionMarket(FEE_BPS, treasury);
 
         // Fund participants
         vm.deal(alice, 100 ether);
         vm.deal(bob,   100 ether);
         vm.deal(carol, 100 ether);
         vm.deal(owner, 100 ether);
+        vm.deal(treasury, 0 ether);
     }
 
     // ─────────────────────────────────────────────────────────────────
@@ -45,7 +47,7 @@ contract PredictionMarketTest is Test {
     // ─────────────────────────────────────────────────────────────────
 
     function _createDefaultMarket() internal returns (uint256 marketId) {
-        marketId = pm.createMarket{value: INITIAL_LIQUIDITY}(
+        marketId = pm.createMarket{value: INITIAL_LIQUIDITY + pm.serviceFee()}(
             "Will BTC hit $100k before 2026?",
             "Crypto",
             oracle,
@@ -60,13 +62,15 @@ contract PredictionMarketTest is Test {
     function test_Deployment_FeeSet() public view {
         assertEq(pm.platformFeeBps(), FEE_BPS);
         assertEq(pm.owner(), owner);
+        assertEq(pm.treasuryAddress(), treasury);
+        assertEq(pm.serviceFee(), (0.01 ether * 1_000) / 10_000);
         assertEq(pm.marketCount(), 0);
         assertFalse(pm.globalPause());
     }
 
     function test_Deployment_RevertIfFeeTooHigh() public {
         vm.expectRevert(KitePredictionMarket.FeeTooHigh.selector);
-        new KitePredictionMarket(501);
+        new KitePredictionMarket(501, treasury);
     }
 
     // ─────────────────────────────────────────────────────────────────
@@ -93,17 +97,27 @@ contract PredictionMarketTest is Test {
         emit KitePredictionMarket.MarketCreated(
             0, owner, "Q?", "Cat", oracle, block.timestamp + DEADLINE_OFFSET, INITIAL_LIQUIDITY
         );
-        pm.createMarket{value: INITIAL_LIQUIDITY}(
+        pm.createMarket{value: INITIAL_LIQUIDITY + pm.serviceFee()}(
             "Q?", "Cat", oracle, block.timestamp + DEADLINE_OFFSET
         );
     }
 
     function test_CreateMarket_MultipleMarkets() public {
         _createDefaultMarket();
-        pm.createMarket{value: INITIAL_LIQUIDITY}(
+        pm.createMarket{value: INITIAL_LIQUIDITY + pm.serviceFee()}(
             "Will ETH flip BTC?", "Crypto", oracle, block.timestamp + DEADLINE_OFFSET
         );
         assertEq(pm.marketCount(), 2);
+    }
+
+    function test_CreateMarket_TransfersServiceFeeToTreasury() public {
+        uint256 treasuryBefore = treasury.balance;
+        uint256 id = _createDefaultMarket();
+
+        assertEq(treasury.balance, treasuryBefore + pm.serviceFee());
+
+        KitePredictionMarket.Market memory m = pm.getMarketInfo(id);
+        assertEq(m.yesReserve + m.noReserve, INITIAL_LIQUIDITY);
     }
 
     function test_CreateMarket_RevertInsufficientLiquidity() public {
@@ -114,15 +128,17 @@ contract PredictionMarketTest is Test {
     }
 
     function test_CreateMarket_RevertDeadlineInPast() public {
+        uint256 funding = INITIAL_LIQUIDITY + pm.serviceFee();
         vm.expectRevert(KitePredictionMarket.DeadlineInPast.selector);
-        pm.createMarket{value: INITIAL_LIQUIDITY}(
+        pm.createMarket{value: funding}(
             "Q?", "Cat", oracle, block.timestamp - 1
         );
     }
 
     function test_CreateMarket_RevertInvalidOracle() public {
+        uint256 funding = INITIAL_LIQUIDITY + pm.serviceFee();
         vm.expectRevert(KitePredictionMarket.InvalidOracle.selector);
-        pm.createMarket{value: INITIAL_LIQUIDITY}(
+        pm.createMarket{value: funding}(
             "Q?", "Cat", address(0), block.timestamp + DEADLINE_OFFSET
         );
     }
@@ -383,8 +399,9 @@ contract PredictionMarketTest is Test {
         _createDefaultMarket();
         pm.setGlobalPause(true);
 
+        uint256 funding = INITIAL_LIQUIDITY + pm.serviceFee();
         vm.expectRevert(KitePredictionMarket.GloballyPaused.selector);
-        pm.createMarket{value: INITIAL_LIQUIDITY}(
+        pm.createMarket{value: funding}(
             "Q?", "Cat", oracle, block.timestamp + DEADLINE_OFFSET
         );
     }
@@ -397,6 +414,14 @@ contract PredictionMarketTest is Test {
     function test_SetPlatformFee_TooHigh_Revert() public {
         vm.expectRevert(KitePredictionMarket.FeeTooHigh.selector);
         pm.setPlatformFee(600);
+    }
+
+    function test_SetTreasuryAddress() public {
+        address newTreasury = makeAddr("newTreasury");
+
+        pm.setTreasuryAddress(newTreasury);
+
+        assertEq(pm.treasuryAddress(), newTreasury);
     }
 
     function test_WithdrawFees() public {
@@ -500,8 +525,8 @@ contract PredictionMarketTest is Test {
         liquidity      = bound(liquidity,      0.01 ether, 50 ether);
         deadlineOffset = bound(deadlineOffset, 1,           365 days);
 
-        vm.deal(address(this), liquidity + 1 ether);
-        uint256 id = pm.createMarket{value: liquidity}(
+        vm.deal(address(this), liquidity + pm.serviceFee());
+        uint256 id = pm.createMarket{value: liquidity + pm.serviceFee()}(
             "Fuzz Q?",
             "Fuzz",
             oracle,

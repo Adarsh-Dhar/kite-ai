@@ -1,18 +1,10 @@
 """
-agent/architect.py — Market Architect (v3 — Groq Function Calling for URL Verification)
-=========================================================================================
-Two responsibilities:
-  1. TSS Filter — Score every PR with a Technical Significance Score.
-  2. Market Generator — Call LLM to convert high-signal PRs into structured
-     prediction market JSON objects WITH deterministic resolution strategies.
+agent/architect.py — Prediction Market Architect
+=================================================
+Turns a free-text topic into a structured prediction market draft.
 
-New in v3:
-  • _call_llm() now passes a `tools` array to Groq, forcing the model to
-    call `verify_data_source_url` before committing to a URL.
-  • _execute_tool_call() dispatches tool calls from the LLM response,
-    performs the real HTTP check, and feeds the result back to the model
-    in a second completion turn.
-  • This turns URL hallucination from a silent bug into a caught error.
+The architect keeps the Groq two-turn function-calling flow so the model
+must verify its proposed data_source_url before the final JSON is accepted.
 """
 
 from __future__ import annotations
@@ -25,44 +17,6 @@ from typing import Any
 import httpx
 
 log = logging.getLogger(__name__)
-
-# ── TSS scoring weights ───────────────────────────────────────────────────────
-
-_SIGNAL_KEYWORDS: dict[str, float] = {
-    "alpenglow": 0.40, "turbine": 0.25, "consensus": 0.25,
-    "vote": 0.20, "leader": 0.15, "fork": 0.20, "replay": 0.20,
-    "simd": 0.35, "sip": 0.20,
-    "breaking": 0.30, "breaking change": 0.35, "incompatible": 0.25, "deprecat": 0.15,
-    "runtime": 0.20, "bpf": 0.20, "sbf": 0.20, "loader": 0.15,
-    "scheduler": 0.20, "banking stage": 0.25, "accounts db": 0.20,
-    "snapshot": 0.15, "perf": 0.10,
-    "cve": 0.40, "security": 0.30, "vuln": 0.30,
-    "release": 0.15, "upgrade": 0.15, "migration": 0.15,
-}
-
-_NOISE_KEYWORDS: dict[str, float] = {
-    "typo": -0.60, "readme": -0.55, "docs": -0.50, "documentation": -0.50,
-    "changelog": -0.30, "clippy": -0.30, "fmt": -0.25, "format": -0.25,
-    "whitespace": -0.30, "ui": -0.20, "bump version": -0.20,
-    "dependabot": -0.40, "ci": -0.20, "github action": -0.25, "test only": -0.30,
-}
-
-_CORE_PATH_PATTERNS: list[tuple[re.Pattern[str], float]] = [
-    (re.compile(r"consensus/"), 0.30),
-    (re.compile(r"alpenglow/"), 0.40),
-    (re.compile(r"runtime/"), 0.25),
-    (re.compile(r"bpf/|sbf/"), 0.20),
-    (re.compile(r"accounts.?db/"), 0.20),
-    (re.compile(r"banking.?stage"), 0.20),
-    (re.compile(r"turbine/"), 0.20),
-    (re.compile(r"vote/"), 0.15),
-    (re.compile(r"sdk/program/"), 0.15),
-    (re.compile(r"\.md$"), -0.15),
-    (re.compile(r"docs/"), -0.30),
-    (re.compile(r"\.github/"), -0.20),
-]
-
-DEFAULT_MIN_TSS = 0.65
 
 VALID_RESOLUTION_TYPES = {
     "GITHUB_PR", "GITHUB_RELEASE", "GITHUB_ISSUE",
@@ -111,34 +65,26 @@ _VERIFY_URL_TOOL = {
 # ── System prompt ─────────────────────────────────────────────────────────────
 
 _SYSTEM_PROMPT = """\
-You are a crypto prediction market specialist with deep expertise in Solana \
-blockchain development. You generate structured prediction market proposals from \
-GitHub Pull Requests.
+You are a Prediction Market Architect. Turn a user topic into a structured, \
+binary prediction market draft with a clear title, question, and resolution \
+rules.
 
-CRITICAL RULE: Before finalising any market proposal, you MUST call the \
+CRITICAL RULE: Before finalising any market draft, you MUST call the \
 `verify_data_source_url` tool with your proposed URL. If the tool reports a \
-non-200 status or an error, you must revise the URL and try again until you \
-have a verified, reachable URL. Only then output the final JSON.
+non-200 status or an error, revise the URL and try again until you have a \
+verified, reachable URL. Only then output the final JSON.
 """
 
 _MARKET_GENERATION_PROMPT = """\
-Analyse the following merged Pull Request from the anza-xyz/agave repository \
-and generate a structured prediction market proposal.
+Turn the following user topic into a structured prediction market draft.
 
-## Pull Request Details
-- **Number**: #{number}
-- **Title**: {title}
-- **Author**: {author}
-- **Labels**: {labels}
-- **Files Changed**: {changed_files_count} files (+{additions}/-{deletions} lines)
-- **Key Files**: {key_files}
-- **Body Summary**: {body_snippet}
-- **TSS Score**: {tss_score:.2f} / 1.00
+## User Topic
+{user_prompt}
 
 ## Step 1 — Call verify_data_source_url
 First, decide on your resolution_type and data_source_url. Call the \
-`verify_data_source_url` tool with those values. Wait for the result. \
-If the URL is unreachable, revise and retry.
+`verify_data_source_url` tool with those values. Wait for the result. If the \
+URL is unreachable, revise and retry.
 
 ## Step 2 — Output the final JSON
 Once your URL is verified (HTTP 200), output a JSON object with these EXACT keys:
@@ -164,67 +110,16 @@ class MarketArchitect:
         http_client: httpx.AsyncClient,
         llm_api_key: str,
         llm_model: str = "llama-3.3-70b-versatile",
-        min_tss: float = DEFAULT_MIN_TSS,
         llm_endpoint: str = "https://api.groq.com/openai/v1/chat/completions",
     ) -> None:
         self._client = http_client
         self._llm_api_key = llm_api_key
         self._llm_model = llm_model
-        self._min_tss = min_tss
         self._llm_endpoint = llm_endpoint
 
-    # ── TSS Scoring ───────────────────────────────────────────────────────────
-
-    def compute_tss(self, pr: dict[str, Any]) -> float:
-        score = 0.10
-        text_corpus = " ".join([
-            pr.get("title", "").lower(),
-            pr.get("body", "").lower()[:2000],
-            " ".join(pr.get("labels", [])).lower(),
-        ])
-        for keyword, weight in _SIGNAL_KEYWORDS.items():
-            if keyword in text_corpus:
-                score += weight
-        for keyword, weight in _NOISE_KEYWORDS.items():
-            if keyword in text_corpus:
-                score += weight
-        for file_path in pr.get("changed_files", []):
-            path_lower = file_path.lower()
-            for pattern, weight in _CORE_PATH_PATTERNS:
-                if pattern.search(path_lower):
-                    score += weight
-                    break
-        total_churn = pr.get("additions", 0) + pr.get("deletions", 0)
-        if total_churn > 5000:
-            score += 0.15
-        elif total_churn > 1000:
-            score += 0.10
-        elif total_churn > 300:
-            score += 0.05
-        return max(0.0, min(1.0, score))
-
-    def filter_high_signal(self, prs: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        high_signal = []
-        for pr in prs:
-            score = self.compute_tss(pr)
-            pr["tss_score"] = round(score, 4)
-            if score >= self._min_tss:
-                log.info("PR #%s passed TSS (%.2f): %s", pr.get("number"), score, pr.get("title", ""))
-                high_signal.append(pr)
-            else:
-                log.debug("PR #%s filtered (%.2f): %s", pr.get("number"), score, pr.get("title", ""))
-        high_signal.sort(key=lambda p: p["tss_score"], reverse=True)
-        return high_signal
-
-    # ── Market Generation ─────────────────────────────────────────────────────
-
-    async def generate_market_proposal(self, pr: dict[str, Any], max_retries: int = 3) -> dict[str, Any]:
-        """
-        Generate a market proposal using Groq function-calling to verify
-        the data_source_url before accepting the LLM's output.
-        Falls back to a deterministic proposal if the LLM is unavailable.
-        """
-        prompt = self._build_prompt(pr)
+    async def draft_market(self, user_prompt: str, max_retries: int = 3) -> dict[str, Any]:
+        """Draft a market proposal from a free-text user prompt."""
+        prompt = _MARKET_GENERATION_PROMPT.format(user_prompt=user_prompt.strip())
         last_error = "Unknown error"
 
         for attempt in range(max_retries):
@@ -250,21 +145,14 @@ class MarketArchitect:
                     log.warning("[Architect] attempt %d/%d: %s", attempt + 1, max_retries, last_error)
                     continue
 
-                proposal["tss_score"]        = pr.get("tss_score", 0.0)
-                proposal["source_pr_number"] = pr.get("number")
-                proposal["source_pr_url"]    = pr.get("url")
                 return proposal
 
             except Exception as exc:
                 last_error = str(exc)
                 log.warning("[Architect] LLM call failed (attempt %d/%d): %s", attempt + 1, max_retries, exc)
 
-        log.warning("[Architect] All LLM attempts failed — using fallback proposal.")
-        proposal = self._fallback_proposal(pr)
-        proposal["tss_score"]        = pr.get("tss_score", 0.0)
-        proposal["source_pr_number"] = pr.get("number")
-        proposal["source_pr_url"]    = pr.get("url")
-        return proposal
+        log.warning("[Architect] All LLM attempts failed — using fallback draft.")
+        return self._fallback_draft(user_prompt, last_error)
 
     # ── Groq with tool-calling ────────────────────────────────────────────────
 
@@ -426,22 +314,6 @@ class MarketArchitect:
 
     # ── Fallback / parse helpers ──────────────────────────────────────────────
 
-    def _build_prompt(self, pr: dict[str, Any]) -> str:
-        key_files    = ", ".join(pr.get("changed_files", [])[:10]) or "N/A"
-        body_snippet = (pr.get("body", "") or "")[:600].replace("\n", " ")
-        return _MARKET_GENERATION_PROMPT.format(
-            number=pr.get("number", "?"),
-            title=pr.get("title", ""),
-            author=pr.get("author", "unknown"),
-            labels=", ".join(pr.get("labels", [])) or "none",
-            changed_files_count=pr.get("changed_files_count", 0),
-            additions=pr.get("additions", 0),
-            deletions=pr.get("deletions", 0),
-            key_files=key_files,
-            body_snippet=body_snippet,
-            tss_score=pr.get("tss_score", 0.0),
-        )
-
     @staticmethod
     def _parse_llm_response(raw: str) -> dict[str, Any]:
         cleaned = re.sub(r"```json|```", "", raw).strip()
@@ -483,33 +355,23 @@ class MarketArchitect:
             return False, str(exc)
 
     @staticmethod
-    def _fallback_proposal(pr: dict[str, Any]) -> dict[str, Any]:
-        number    = pr.get("number", 0)
-        title     = pr.get("title", "Unknown Change")
-        labels    = ", ".join(pr.get("labels", [])) or "none"
-        pr_api_url = f"https://api.github.com/repos/anza-xyz/agave/pulls/{number}"
+    def _fallback_draft(user_prompt: str, reason: str = "LLM unavailable") -> dict[str, Any]:
+        topic = user_prompt.strip() or "Untitled market idea"
         return {
-            "title": f"Impact of PR #{number}: {title[:60]}",
-            "description": (
-                f"Will the changes introduced in agave PR #{number} "
-                f"({title[:80]}) be merged into the master branch?"
-            ),
+            "title": f"Will {topic[:60]} happen?",
+            "description": f"Will the following prediction resolve to YES: {topic}?",
             "options": ["Yes", "No"],
             "agent_reason": (
-                f"PR #{number} carries a high Technical Significance Score. "
-                f"Labels: {labels}. Fallback proposal — LLM service unavailable."
+                f"Fallback draft generated from the user topic because the LLM draft path was unavailable. Reason: {reason}."
             ),
-            "resolution_type": "GITHUB_PR",
-            "data_source_url": pr_api_url,
+            "resolution_type": "LLM_JUDGE",
+            "data_source_url": "https://example.com",
             "evaluation_logic": {
-                "check":         "merged",
-                "yes_condition": "merged == true",
-                "no_condition":  "state == closed AND merged == false",
+                "question": topic,
+                "uncertainty_action": "Return the most defensible binary interpretation of the topic.",
             },
             "resolution_condition": (
-                "If merged==true → YES. "
-                "If state==closed AND merged==false → NO. "
-                "Past deadline → NO."
+                f"Resolve YES if the topic occurs as stated. Resolve NO if it does not. Topic: {topic}."
             ),
         }
 

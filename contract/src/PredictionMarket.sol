@@ -41,6 +41,9 @@ contract KitePredictionMarket is ReentrancyGuard, Ownable {
     /// @dev Maximum platform fee: 5 %
     uint256 public constant MAX_FEE_BPS = 500;
 
+    /// @dev Market creation service fee: 10% of the minimum liquidity.
+    uint256 public constant SERVICE_FEE_BPS = 1_000;
+
     /// @dev Minimum liquidity the market creator must seed (0.01 KITE)
     uint256 public constant MIN_LIQUIDITY = 0.01 ether;
 
@@ -80,6 +83,8 @@ contract KitePredictionMarket is ReentrancyGuard, Ownable {
 
     uint256 public marketCount;
     uint256 public platformFeeBps;          // Platform fee in BPS (default 200 = 2%)
+    uint256 public serviceFee;              // Flat creation fee charged on every market
+    address public treasuryAddress;         // Treasury receiving service fees
     uint256 public accumulatedFees;         // Total unclaimed platform fees
     bool    public globalPause;             // Emergency kill-switch
 
@@ -134,6 +139,7 @@ contract KitePredictionMarket is ReentrancyGuard, Ownable {
     event OracleUpdated(address indexed oracle, bool approved);
     event FeesWithdrawn(address indexed to, uint256 amount);
     event PlatformFeeUpdated(uint256 newFeeBps);
+    event TreasuryAddressUpdated(address indexed newTreasuryAddress);
     event GlobalPauseSet(bool paused);
     event MarketOracleUpdated(uint256 indexed marketId, address newOracle);
 
@@ -151,6 +157,7 @@ contract KitePredictionMarket is ReentrancyGuard, Ownable {
     error InsufficientShares();
     error SlippageExceeded();
     error InvalidOracle();
+    error InvalidTreasury();
     error NotOracle();
     error FeeTooHigh();
     error ZeroAmount();
@@ -185,9 +192,12 @@ contract KitePredictionMarket is ReentrancyGuard, Ownable {
     //  Constructor
     // ─────────────────────────────────────────────────────────────────
 
-    constructor(uint256 _feeBps) Ownable(msg.sender) {
+    constructor(uint256 _feeBps, address _treasuryAddress) Ownable(msg.sender) {
         if (_feeBps > MAX_FEE_BPS) revert FeeTooHigh();
+        if (_treasuryAddress == address(0)) revert InvalidTreasury();
         platformFeeBps = _feeBps;
+        treasuryAddress = _treasuryAddress;
+        serviceFee = (MIN_LIQUIDITY * SERVICE_FEE_BPS) / BPS_DENOM;
     }
 
     // ─────────────────────────────────────────────────────────────────
@@ -209,15 +219,18 @@ contract KitePredictionMarket is ReentrancyGuard, Ownable {
         string  calldata category,
         address oracle,
         uint256 resolutionDeadline
-    ) external payable notGloballyPaused returns (uint256 marketId) {
+    ) external payable nonReentrant notGloballyPaused returns (uint256 marketId) {
         if (oracle == address(0)) revert InvalidOracle();
-        if (msg.value < MIN_LIQUIDITY) revert InsufficientLiquidity();
+        if (msg.value < MIN_LIQUIDITY + serviceFee) revert InsufficientLiquidity();
+        if (treasuryAddress == address(0)) revert InvalidTreasury();
         if (resolutionDeadline <= block.timestamp) revert DeadlineInPast();
+
+        uint256 marketLiquidity = msg.value - serviceFee;
+        _safeTransferETH(treasuryAddress, serviceFee);
 
         marketId = marketCount++;
 
-        uint256 half = msg.value / 2;
-        uint256 initialShares = _sqrt(half * half); // sqrt(yes*no) = half (since equal)
+        uint256 half = marketLiquidity / 2;
 
         Market storage m = markets[marketId];
         m.question           = question;
@@ -229,13 +242,13 @@ contract KitePredictionMarket is ReentrancyGuard, Ownable {
         m.status             = MarketStatus.OPEN;
         m.outcome            = Outcome.UNRESOLVED;
         m.yesReserve         = half;
-        m.noReserve          = msg.value - half;   // handles odd wei
-        m.yesSupply          = initialShares;
-        m.noSupply            = initialShares;
+        m.noReserve          = marketLiquidity - half;   // handles odd wei
+        m.yesSupply          = half;
+        m.noSupply           = half;
 
         // Give creator initial LP shares (equal split)
-        yesShares[marketId][msg.sender] = initialShares;
-        noShares[marketId][msg.sender]  = initialShares;
+        yesShares[marketId][msg.sender] = half;
+        noShares[marketId][msg.sender]  = half;
 
         emit MarketCreated(
             marketId,
@@ -244,7 +257,7 @@ contract KitePredictionMarket is ReentrancyGuard, Ownable {
             category,
             oracle,
             resolutionDeadline,
-            msg.value
+            marketLiquidity
         );
     }
 
@@ -506,6 +519,12 @@ contract KitePredictionMarket is ReentrancyGuard, Ownable {
         if (feeBps > MAX_FEE_BPS) revert FeeTooHigh();
         platformFeeBps = feeBps;
         emit PlatformFeeUpdated(feeBps);
+    }
+
+    function setTreasuryAddress(address newTreasuryAddress) external onlyOwner {
+        if (newTreasuryAddress == address(0)) revert InvalidTreasury();
+        treasuryAddress = newTreasuryAddress;
+        emit TreasuryAddressUpdated(newTreasuryAddress);
     }
 
     function setApprovedOracle(address oracle, bool approved) external onlyOwner {

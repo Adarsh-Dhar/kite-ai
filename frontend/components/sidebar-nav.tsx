@@ -5,11 +5,10 @@ import { usePathname } from 'next/navigation';
 import {
   LayoutDashboard,
   Compass,
-  TrendingUp,
-  GitBranch,
   User,
   Terminal,
   BarChart2,
+  SquarePen,
 } from 'lucide-react';
 
 const navItems = [
@@ -30,6 +29,12 @@ const navItems = [
     href: '/markets',
     icon: BarChart2,
     description: 'Prediction Markets',
+  },
+  {
+    label: 'Create',
+    href: '/create',
+    icon: SquarePen,
+    description: 'Draft Market',
   },
   {
     label: 'Architect',

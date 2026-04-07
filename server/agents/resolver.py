@@ -35,6 +35,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import re
 import httpx
 from datetime import datetime, timezone, timedelta
@@ -59,13 +60,13 @@ class ResolverAgent:
     def __init__(
         self,
         kite_client: Any,
-        github_token: str,
+        github_token: str = os.getenv("GITHUB_TOKEN", ""),
         llm_api_key: str = "",
         llm_endpoint: str = "https://api.groq.com/openai/v1/chat/completions",
         llm_model: str = "llama-3.3-70b-versatile",
         rpc_url: str = "https://rpc-testnet.gokite.ai",
-        repo_owner: str = "anza-xyz",
-        repo_name: str = "agave",
+        repo_owner: str = os.getenv("GITHUB_REPO_OWNER", "anza-xyz"),
+        repo_name: str = os.getenv("GITHUB_REPO_NAME", "agave"),
         nvd_api_key: str = "",
     ) -> None:
         self._kite = kite_client
@@ -824,11 +825,8 @@ async def continuous_resolver_loop(kite_client: Any, settings: Any) -> None:
     """
     agent = ResolverAgent(
         kite_client=kite_client,
-        github_token=settings.github_token,
-        llm_api_key=settings.llm_api_key,
-        rpc_url=settings.kite_rpc_url,
-        repo_owner=settings.github_repo_owner,
-        repo_name=settings.github_repo_name,
+        llm_api_key=getattr(settings, "llm_api_key", ""),
+        rpc_url=getattr(settings, "kite_rpc_url", "https://rpc-testnet.gokite.ai"),
     )
     await agent.run_loop()
 

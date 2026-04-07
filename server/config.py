@@ -16,14 +16,6 @@ class Settings(BaseSettings):
         description="PostgreSQL connection string for Prisma.",
     )
 
-    # ── GitHub ───────────────────────────────────────────────────────────────
-    github_token: str = Field(
-        ...,
-        alias="GITHUB_TOKEN",
-    )
-    github_repo_owner: str = Field(default="anza-xyz", alias="GITHUB_REPO_OWNER")
-    github_repo_name: str = Field(default="agave", alias="GITHUB_REPO_NAME")
-
     # ── LLM (Groq) ───────────────────────────────────────────────────────────
     llm_api_key: str = Field(default="", alias="GROQ_API_KEY")
     llm_model: str = Field(default="llama-3.3-70b-versatile", alias="GROQ_MODEL")
@@ -44,9 +36,7 @@ class Settings(BaseSettings):
     )
 
     # ── Agent behaviour ───────────────────────────────────────────────────────
-    min_tss_score: float = Field(default=0.65, alias="MIN_TSS_SCORE")
     poll_interval_seconds: int = Field(default=300, alias="POLL_INTERVAL_SECONDS")
-    pr_fetch_limit: int = Field(default=50, alias="PR_FETCH_LIMIT")
     market_resolution_days: int = Field(default=30, alias="MARKET_RESOLUTION_DAYS")
     market_initial_liquidity_eth: float = Field(default=0.05, alias="MARKET_INITIAL_LIQUIDITY_ETH")
     dry_run: bool = Field(default=False, alias="DRY_RUN")

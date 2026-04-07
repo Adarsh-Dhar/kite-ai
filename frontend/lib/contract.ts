@@ -4,6 +4,8 @@ import { CONTRACT_ADDRESS } from "./address";
 export const RPC_URL = 'https://rpc-testnet.gokite.ai';
 export const CHAIN_ID = 2368;
 export const CHAIN_HEX = '0x940'; // 2368 in hex
+export const DEFAULT_MARKET_INITIAL_LIQUIDITY_ETH = 0.05;
+export const MARKET_SERVICE_FEE_BPS = 1_000;
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -38,6 +40,17 @@ export interface Market {
   feesCollected: bigint;
 }
 
+export interface DraftMarket {
+  title: string;
+  description: string;
+  options?: string[];
+  agent_reason?: string;
+  resolution_type: string;
+  data_source_url: string;
+  evaluation_logic: Record<string, unknown>;
+  resolution_condition: string;
+}
+
 // ─── Read Helpers (no wallet needed) ─────────────────────────────────────────
 
 async function rpcCall(method: string, params: any[]): Promise<any> {
@@ -61,13 +74,23 @@ async function getReadContract() {
 /** Returns a write-enabled ethers Contract instance via MetaMask */
 async function getWriteContract() {
   if (typeof window === 'undefined' || !window.ethereum)
-    throw new Error('MetaMask not found. Please install MetaMask.');
+    throw new Error('No injected wallet provider found.');
 
   const { ethers } = await import('ethers');
   await switchToKiteChain();
   const provider = new ethers.BrowserProvider(window.ethereum);
   const signer = await provider.getSigner();
   return new ethers.Contract(CONTRACT_ADDRESS, CONTRACT_ABI, signer);
+}
+
+export function getCreateMarketCosts(initialLiquidityEth = DEFAULT_MARKET_INITIAL_LIQUIDITY_ETH) {
+  const serviceFeeEth = initialLiquidityEth * (MARKET_SERVICE_FEE_BPS / 10_000);
+  const totalEth = initialLiquidityEth + serviceFeeEth;
+  return {
+    initialLiquidityEth,
+    serviceFeeEth,
+    totalEth,
+  };
 }
 
 // ─── Chain switching ──────────────────────────────────────────────────────────
@@ -205,9 +228,31 @@ export async function redeemWinnings(marketId: number): Promise<string> {
   return tx.hash;
 }
 
+export async function createMarketFromDraft(
+  draft: DraftMarket,
+  oracleAddress: string,
+  initialLiquidityEth = DEFAULT_MARKET_INITIAL_LIQUIDITY_ETH,
+): Promise<string> {
+  const { ethers } = await import('ethers');
+  const contract = await getWriteContract();
+  const { totalEth } = getCreateMarketCosts(initialLiquidityEth);
+  const question = draft.title.trim() || draft.description.trim();
+  const category = draft.resolution_type.trim() || 'General';
+  const resolutionDeadline = Math.floor(Date.now() / 1000) + 30 * 24 * 60 * 60;
+  const tx = await contract.createMarket(
+    question,
+    category,
+    oracleAddress,
+    resolutionDeadline,
+    { value: ethers.parseEther(totalEth.toString()) },
+  );
+  await tx.wait();
+  return tx.hash;
+}
+
 export async function connectWallet(): Promise<string> {
   if (typeof window === 'undefined' || !window.ethereum)
-    throw new Error('MetaMask not found.');
+    throw new Error('No injected wallet provider found.');
   const accounts = await window.ethereum.request({ method: 'eth_requestAccounts' });
   return accounts[0];
 }
