@@ -22,6 +22,10 @@ export enum Outcome {
   INVALID = 3,
 }
 
+// ─── Default Configuration ────────────────────────────────────────────────────
+// Oracle address for market resolution (can be overridden per market)
+export const DEFAULT_ORACLE_ADDRESS = '0x7Ee3A3a6E3f5B2c4d9f8a1e2b3c4d5E6F7a8b9c';
+
 export interface Market {
   id: number;
   question: string;
@@ -44,11 +48,14 @@ export interface DraftMarket {
   title: string;
   description: string;
   options?: string[];
+  category?: string;
   agent_reason?: string;
   resolution_type: string;
-  data_source_url: string;
-  evaluation_logic: Record<string, unknown>;
-  resolution_condition: string;
+  data_source_url?: string;
+  evaluation_logic?: Record<string, unknown>;
+  resolution_condition?: string;
+  outcomes?: string[];
+  [key: string]: unknown;
 }
 
 // ─── Read Helpers (no wallet needed) ─────────────────────────────────────────
@@ -230,31 +237,96 @@ export async function redeemWinnings(marketId: number): Promise<string> {
 
 export async function createMarketFromDraft(
   draft: DraftMarket,
-  oracleAddress: string,
+  oracleAddress: string = DEFAULT_ORACLE_ADDRESS,
   initialLiquidityEth = DEFAULT_MARKET_INITIAL_LIQUIDITY_ETH,
-): Promise<string> {
+): Promise<{ hash: string; blockNumber?: number }> {
   const { ethers } = await import('ethers');
+  
+  // Ensure wallet is connected and on correct chain
+  await switchToKiteChain();
   const contract = await getWriteContract();
-  const { totalEth } = getCreateMarketCosts(initialLiquidityEth);
-  const question = draft.title.trim() || draft.description.trim();
-  const category = draft.resolution_type.trim() || 'General';
+  
+  // Calculate total ETH needed (liquidity + service fee)
+  const { totalEth, serviceFeeEth, initialLiquidityEth: actualLiquidity } = getCreateMarketCosts(initialLiquidityEth);
+  
+  // Extract market details from draft
+  const question = (draft.title || draft.description || '').trim();
+  const category = (draft.category || draft.resolution_type || 'General').trim();
+  
+  if (!question) {
+    throw new Error('Market title is required');
+  }
+  
+  // Set resolution deadline to 30 days from now
   const resolutionDeadline = Math.floor(Date.now() / 1000) + 30 * 24 * 60 * 60;
-  const tx = await contract.createMarket(
+  
+  console.log('Creating market with:', {
     question,
     category,
-    oracleAddress,
+    oracle: oracleAddress,
     resolutionDeadline,
-    { value: ethers.parseEther(totalEth.toString()) },
-  );
-  await tx.wait();
-  return tx.hash;
+    initialLiquidity: actualLiquidity,
+    serviceFee: serviceFeeEth,
+    totalValue: totalEth,
+  });
+  
+  try {
+    const tx = await contract.createMarket(
+      question,
+      category,
+      oracleAddress,
+      resolutionDeadline,
+      { value: ethers.parseEther(totalEth.toString()) },
+    );
+    
+    console.log('Market creation transaction sent:', tx.hash);
+    
+    // Wait for transaction to be mined
+    const receipt = await tx.wait();
+    
+    if (!receipt) {
+      throw new Error('Transaction failed - no receipt returned');
+    }
+    
+    console.log('Market created successfully:', {
+      hash: tx.hash,
+      blockNumber: receipt.blockNumber,
+    });
+    
+    return {
+      hash: tx.hash,
+      blockNumber: receipt.blockNumber,
+    };
+  } catch (err) {
+    const message = err instanceof Error ? err.message : 'Unknown error';
+    console.error('Market creation error:', message);
+    // Re-throw with helpful context
+    if (message.includes('insufficient funds')) {
+      throw new Error(`Insufficient funds. Required: ${totalEth} KITE (${actualLiquidity} liquidity + ${serviceFeeEth} fee)`);
+    }
+    if (message.includes('user rejected')) {
+      throw new Error('Transaction rejected by user');
+    }
+    throw new Error(`Market creation failed: ${message}`);
+  }
 }
 
 export async function connectWallet(): Promise<string> {
   if (typeof window === 'undefined' || !window.ethereum)
     throw new Error('No injected wallet provider found.');
   const accounts = await window.ethereum.request({ method: 'eth_requestAccounts' });
+  await switchToKiteChain();
   return accounts[0];
+}
+
+export async function getCurrentAddress(): Promise<string | null> {
+  if (typeof window === 'undefined' || !window.ethereum) return null;
+  try {
+    const accounts = await window.ethereum.request({ method: 'eth_accounts' });
+    return accounts?.[0] || null;
+  } catch {
+    return null;
+  }
 }
 
 // ─── Formatting Utilities ─────────────────────────────────────────────────────

@@ -1,8 +1,9 @@
 'use client'
 
 import { DashboardLayout } from '@/components/dashboard-layout'
-import { Terminal as TerminalIcon, Play, Pause, Filter, Copy } from 'lucide-react'
+import { Terminal as TerminalIcon, Play, Pause, Filter, Copy, X, Eye } from 'lucide-react'
 import { useEffect, useState, useRef } from 'react'
+import { useSearchParams } from 'next/navigation'
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -64,18 +65,14 @@ function parseLog(raw: string): ParsedLog {
 
 // ── Component ─────────────────────────────────────────────────────────────────
 
-const WS_URL =
-  typeof window !== 'undefined'
-    ? `${window.location.protocol === 'https:' ? 'wss' : 'ws'}://${
-        process.env.NEXT_PUBLIC_BACKEND_HOST ?? 'localhost:8000'
-      }/ws/logs`
-    : 'ws://localhost:8000/ws/logs'
-
 const FILTER_LEVELS: Array<ParsedLog['level'] | 'ALL'> = [
   'ALL', 'INFO', 'WARNING', 'ERROR', 'DEBUG',
 ]
 
 export default function TerminalPage() {
+  const searchParams = useSearchParams()
+  const sessionParam = searchParams?.get('session')
+  
   const [logs, setLogs] = useState<ParsedLog[]>([
     parseLog('[system] Initializing KiteAI Agent Terminal…'),
     parseLog('[system] Connecting to backend server…'),
@@ -85,6 +82,7 @@ export default function TerminalPage() {
   const [showFilters, setShowFilters] = useState(false)
   const [levelFilter, setLevelFilter] = useState<ParsedLog['level'] | 'ALL'>('ALL')
   const [searchTerm, setSearchTerm] = useState('')
+  const [currentSession, setCurrentSession] = useState<string | null>(sessionParam || null)
 
   const scrollRef = useRef<HTMLDivElement>(null)
   const pausedRef = useRef(paused)
@@ -100,14 +98,26 @@ export default function TerminalPage() {
     let reconnectTimer: ReturnType<typeof setTimeout>
 
     function connect() {
-      ws = new WebSocket(WS_URL)
+      // Build WebSocket URL with session filter if provided
+      const baseWsUrl = `${window.location.protocol === 'https:' ? 'wss' : 'ws'}://${
+        process.env.NEXT_PUBLIC_BACKEND_HOST ?? 'localhost:8000'
+      }/ws/logs`
+      
+      const wsUrl = currentSession 
+        ? `${baseWsUrl}?session=${encodeURIComponent(currentSession)}`
+        : baseWsUrl
+        
+      ws = new WebSocket(wsUrl)
       wsRef.current = ws
 
       ws.onopen = () => {
         setConnected(true)
+        const sessionMsg = currentSession 
+          ? `Listening for logs from session: ${currentSession}`
+          : 'Listening for all agent activity…'
         setLogs((prev) => [
           ...prev,
-          parseLog('[system] INFO: Connection established. Listening for agent activity…'),
+          parseLog(`[system] INFO: Connection established. ${sessionMsg}`),
         ])
       }
 
@@ -148,7 +158,7 @@ export default function TerminalPage() {
       clearTimeout(reconnectTimer)
       ws?.close()
     }
-  }, [])
+  }, [currentSession])
 
   // ── Flush buffer when unpausing ───────────────────────────────────────────
   useEffect(() => {
@@ -187,7 +197,7 @@ export default function TerminalPage() {
         {/* ── Header ── */}
         <section className="border-b border-[#1a1a1a] px-8 py-6 bg-gradient-to-b from-[#1a1a1a]/50 to-[#000000]">
           <div className="max-w-7xl mx-auto">
-            <div className="flex items-center justify-between">
+            <div className="flex items-center justify-between mb-4">
               <div>
                 <h1 className="text-3xl font-black text-white mb-1">The Raw Feed</h1>
                 <p className="text-[#888888]">
@@ -244,6 +254,24 @@ export default function TerminalPage() {
                 </button>
               </div>
             </div>
+
+            {/* Session indicator */}
+            {currentSession && (
+              <div className="mb-4 flex items-center gap-3 px-4 py-3 bg-[#1a1a1a]/50 border border-[#00ff00]/20 rounded-lg">
+                <Eye size={16} className="text-[#00ff00]" />
+                <div className="flex-1">
+                  <p className="text-[#00ff00] text-sm font-semibold">Watching Draft Generation</p>
+                  <p className="text-[#666666] text-xs font-mono mt-0.5">{currentSession}</p>
+                </div>
+                <button
+                  onClick={() => setCurrentSession(null)}
+                  className="flex items-center gap-1 px-3 py-1.5 text-xs text-[#888888] hover:text-[#ff3333] hover:bg-[#ff3333]/10 border border-[#333333] hover:border-[#ff3333] rounded transition-colors"
+                >
+                  <X size={14} />
+                  Clear
+                </button>
+              </div>
+            )}
 
             {/* ── Filter panel ── */}
             {showFilters && (

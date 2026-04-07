@@ -24,7 +24,7 @@ from agents.resolver import continuous_resolver_loop
 from blockchain.kite_client import KiteClient
 from config import Settings
 from db import connect_db, disconnect_db
-from ws_logger import WebSocketLogHandler, ws_manager, log_broadcaster
+from ws_logger import WebSocketLogHandler, ws_manager, log_broadcaster, current_session_id
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 # Attach the WebSocket handler to the root logger so every log.info() /
@@ -140,12 +140,14 @@ app.add_middleware(
 # ── WebSocket endpoint ────────────────────────────────────────────────────────
 
 @app.websocket('/ws/logs')
-async def websocket_logs(websocket: WebSocket) -> None:
+async def websocket_logs(websocket: WebSocket, session: str | None = None) -> None:
     """
     Real-time log stream. Connect from the Terminal page to receive
     every log.info / log.warning / log.error emitted by the agent.
+    
+    Optional query param: ?session=<session_id> to filter logs from a specific session.
     """
-    await ws_manager.connect(websocket)
+    await ws_manager.connect(websocket, session_filter=session)
     try:
         # Keep the connection alive — we only push; the client needn't send anything.
         while True:
@@ -156,6 +158,7 @@ async def websocket_logs(websocket: WebSocket) -> None:
 
 class DraftMarketRequest(BaseModel):
     prompt: str
+    session_id: str | None = None
 
 
 # ── REST Routes ───────────────────────────────────────────────────────────────
@@ -204,6 +207,10 @@ async def agent_status() -> dict:
 async def draft_market(body: DraftMarketRequest) -> dict:
     if _http_client is None:
         raise RuntimeError('HTTP client not initialised.')
+
+    # Set session context for logging
+    if body.session_id:
+        current_session_id.set(body.session_id)
 
     architect = MarketArchitect(
         http_client=_http_client,
