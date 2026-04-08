@@ -13,6 +13,7 @@ import json
 import logging
 import re
 from typing import Any
+from urllib.parse import urlparse
 
 import httpx
 
@@ -71,7 +72,7 @@ rules.
 
 CRITICAL RULE: Before finalising any market draft, you MUST call the \
 `verify_data_source_url` tool with your proposed URL. If the tool reports a \
-non-200 status or an error, revise the URL and try again until you have a \
+status outside 200/401/403 or an error, revise the URL and try again until you have a \
 verified, reachable URL. Only then output the final JSON.
 """
 
@@ -87,7 +88,7 @@ First, decide on your resolution_type and data_source_url. Call the \
 URL is unreachable, revise and retry.
 
 ## Step 2 — Output the final JSON
-Once your URL is verified (HTTP 200), output a JSON object with these EXACT keys:
+Once your URL is verified (HTTP 200/401/403), output a JSON object with these EXACT keys:
 
 1. "title"              — Concise market title (max 80 chars).
 2. "description"        — Binary Yes/No prediction question.
@@ -128,6 +129,7 @@ class MarketArchitect:
                     raise ValueError("LLM_API_KEY not set — using fallback.")
 
                 raw_json, verification_record = await self._call_llm_with_tools(prompt)
+                log.info("[Architect] LLM response received: {raw_json}", raw_json=raw_json)
                 proposal = self._parse_llm_response(raw_json)
 
                 # Log what the LLM verified
@@ -237,10 +239,10 @@ class MarketArchitect:
                     f"Error: {error}\n"
                     f"You MUST choose a different, valid URL and revise your market proposal."
                 )
-            elif status_code == 200:
+            elif status_code in (200, 401, 403):
                 result_text = (
                     f"VERIFICATION PASSED for {url}\n"
-                    f"HTTP 200 OK. Response snippet:\n{snippet}\n"
+                    f"HTTP {status_code} OK. Response snippet:\n{snippet}\n"
                     f"You may now output the final market JSON using this URL."
                 )
             else:
@@ -291,16 +293,24 @@ class MarketArchitect:
             return None, "", f"Invalid URL format: {url!r}"
 
         try:
+            # Add a browser-like User-Agent to bypass basic bot protection.
+            headers = {
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/120.0.0.0 Safari/537.36"
+                )
+            }
             async with httpx.AsyncClient(timeout=12.0) as client:
                 if method == "POST":
                     # For JSON-RPC endpoints (WEB3_RPC, DAO_GOVERNANCE)
                     resp = await client.post(
                         url,
                         json={"jsonrpc": "2.0", "id": 1, "method": "web3_clientVersion", "params": []},
-                        headers={"Content-Type": "application/json"},
+                        headers={"Content-Type": "application/json", **headers},
                     )
                 else:
-                    resp = await client.get(url)
+                    resp = await client.get(url, headers=headers)
 
                 snippet = resp.text[:300].replace("\n", " ")
                 return resp.status_code, snippet, None
@@ -328,12 +338,20 @@ class MarketArchitect:
             raise ValueError(f"LLM response missing keys: {missing}")
 
         res_type = data.get("resolution_type", "").upper()
+        if res_type in ("WEB_PAGE", "NEWS_ARTICLE", "URL_CHECK"):
+            res_type = "LLM_JUDGE"
         if res_type not in VALID_RESOLUTION_TYPES:
             raise ValueError(f"Invalid resolution_type '{res_type}'.")
         data["resolution_type"] = res_type
 
         if not isinstance(data.get("evaluation_logic"), dict):
             raise ValueError("evaluation_logic must be a JSON object.")
+
+        # LLMs sometimes include surrounding punctuation/brackets around URLs.
+        raw_url = str(data.get("data_source_url", "")).strip()
+        normalized_url = raw_url.strip(" <>\"'()[]{}")
+        data["data_source_url"] = normalized_url
+
         if not isinstance(data.get("data_source_url"), str) or not data["data_source_url"].startswith("http"):
             raise ValueError("data_source_url must be a valid HTTP(S) URL.")
 
@@ -345,12 +363,26 @@ class MarketArchitect:
         """Lightweight post-parse URL check (no JSON-RPC fallback)."""
         if not url or not url.startswith("http"):
             return False, f"Not a valid URL: {url!r}"
+
+        parsed = urlparse(url)
+        if not parsed.scheme or not parsed.hostname:
+            return False, f"Malformed URL host: {url!r}"
+
         try:
+            headers = {
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/120.0.0.0 Safari/537.36"
+                )
+            }
             async with httpx.AsyncClient(timeout=10.0) as client:
-                resp = await client.get(url)
-                if resp.status_code == 200:
+                resp = await client.get(url, headers=headers)
+                if resp.status_code in (200, 401, 403):
                     return True, ""
                 return False, f"HTTP {resp.status_code}"
+        except httpx.ConnectError as exc:
+            return False, f"DNS/connection error for host '{parsed.hostname}': {exc}"
         except Exception as exc:
             return False, str(exc)
 

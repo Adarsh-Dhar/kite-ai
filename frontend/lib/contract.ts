@@ -74,6 +74,9 @@ async function rpcCall(method: string, params: any[]): Promise<any> {
 /** Returns a read-only ethers Contract instance via public RPC */
 async function getReadContract() {
   const { ethers } = await import('ethers');
+  if (!CONTRACT_ADDRESS || !ethers.isAddress(CONTRACT_ADDRESS)) {
+    throw new Error(`Invalid CONTRACT_ADDRESS configuration: ${String(CONTRACT_ADDRESS)}`);
+  }
   const provider = new ethers.JsonRpcProvider(RPC_URL);
   return new ethers.Contract(CONTRACT_ADDRESS, CONTRACT_ABI, provider);
 }
@@ -84,6 +87,9 @@ async function getWriteContract() {
     throw new Error('No injected wallet provider found.');
 
   const { ethers } = await import('ethers');
+  if (!CONTRACT_ADDRESS || !ethers.isAddress(CONTRACT_ADDRESS)) {
+    throw new Error(`Invalid CONTRACT_ADDRESS configuration: ${String(CONTRACT_ADDRESS)}`);
+  }
   await switchToKiteChain();
   const provider = new ethers.BrowserProvider(window.ethereum);
   const signer = await provider.getSigner();
@@ -241,6 +247,9 @@ export async function createMarketFromDraft(
   initialLiquidityEth = DEFAULT_MARKET_INITIAL_LIQUIDITY_ETH,
 ): Promise<{ hash: string; blockNumber?: number }> {
   const { ethers } = await import('ethers');
+  if (!ethers.isAddress(oracleAddress)) {
+    throw new Error(`Invalid oracle address: ${String(oracleAddress)}`);
+  }
   
   // Ensure wallet is connected and on correct chain
   await switchToKiteChain();

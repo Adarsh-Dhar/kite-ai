@@ -95,8 +95,8 @@ export default function CreateMarketPage() {
         resolution_condition: draft.resolution_condition.trim(),
       };
 
-      const hash = await createMarketFromDraft(payload, connectedWallet, DEFAULT_MARKET_INITIAL_LIQUIDITY_ETH);
-      setTxHash(hash);
+      const result = await createMarketFromDraft(payload, undefined, DEFAULT_MARKET_INITIAL_LIQUIDITY_ETH);
+      setTxHash(result.hash);
     } catch (deployError) {
       setError(formatError(deployError));
     } finally {

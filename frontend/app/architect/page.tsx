@@ -7,7 +7,7 @@ import { Spinner } from '@/components/ui/spinner';
 import { Zap, AlertCircle, CheckCircle2, Send, Eye, Edit2, Check, X } from 'lucide-react';
 import { useState, useEffect } from 'react';
 import React from 'react';
-import { createMarketFromDraft, connectWallet, getCurrentAddress, getCreateMarketCosts } from '@/lib/contract';
+import { createMarketFromDraft, connectWallet, getCreateMarketCosts } from '@/lib/contract';
 import Link from 'next/link';
 
 interface DraftMarket {
@@ -143,7 +143,7 @@ export default function ArchitectPage() {
       console.log('Required funds:', totalEth, 'KITE');
 
       // Call the blockchain deployment function
-      const result = await createMarketFromDraft(finalDraft as any, userAddress as string);
+      const result = await createMarketFromDraft(finalDraft as any);
 
       console.log('Market deployed successfully:', result);
 
